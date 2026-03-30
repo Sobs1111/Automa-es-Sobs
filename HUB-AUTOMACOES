@@ -1083,7 +1083,7 @@ fn_status_servicos() {
     for i in "${!servicos[@]}"; do
         if systemctl is-active --quiet "${servicos[$i]}" 2>/dev/null; then
             status="ATIVO"
-        elif systemctl list-unit-files "${servicos[$i]}.service" &>/dev/null | grep -q "${servicos[$i]}"; then
+        elif systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${servicos[$i]}.service"; then
             status="INATIVO"
         else
             status="NAO INSTALADO"
@@ -1095,23 +1095,20 @@ fn_status_servicos() {
 }
 
 fn_reiniciar_servico() {
-    local servicos=(unbound monitor-unbound zabbix-agent2 krill routinator ookla nperf-server rota-persistente)
-    local nomes=("DNS Unbound" "Monitor Unbound" "Zabbix-Agent2" "Krill" "Routinator" "Ookla" "nPerf" "Rota Persistente")
-
     local opts=()
-    for i in "${!servicos[@]}"; do
-        if systemctl list-unit-files "${servicos[$i]}.service" &>/dev/null | grep -q "${servicos[$i]}"; then
-            opts+=("${servicos[$i]}" "${nomes[$i]}")
-        fi
-    done
+
+    while IFS= read -r linha; do
+        svc=$(echo "$linha" | awk '{print $1}' | sed 's/\.service//')
+        opts+=("$svc" "")
+    done < <(systemctl list-units --type=service --state=active --no-legend --no-pager 2>/dev/null)
 
     if [[ ${#opts[@]} -eq 0 ]]; then
-        whiptail --title "Reiniciar Servico" --msgbox "Nenhum servico gerenciado encontrado." 8 50
+        whiptail --title "Reiniciar Servico" --msgbox "Nenhum servico ativo encontrado." 8 50
         return 1
     fi
 
     svc=$(whiptail --title "Reiniciar Servico" \
-        --menu "Selecione o servico para reiniciar:" 20 60 8 \
+        --menu "Selecione o servico para reiniciar:" 20 60 12 \
         "${opts[@]}" \
         3>&1 1>&2 2>&3)
     [[ $? -ne 0 ]] && return 1
@@ -1119,9 +1116,9 @@ fn_reiniciar_servico() {
     systemctl restart "$svc"
 
     if systemctl is-active --quiet "$svc"; then
-        whiptail --title "Concluido" --msgbox "Servico '$svc' reiniciado com sucesso." 8 50
+        whiptail --title "Concluido" --msgbox "Servico '$svc' reiniciado com sucesso." 8 55
     else
-        whiptail --title "Erro" --msgbox "Falha ao reiniciar '$svc'. Verifique com:\nsystemctl status $svc" 10 60
+        whiptail --title "Erro" --msgbox "Falha ao reiniciar '$svc'.\nVerifique com: systemctl status $svc" 10 60
     fi
 }
 
