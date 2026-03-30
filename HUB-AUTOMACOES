@@ -1076,22 +1076,15 @@ fn_tcpdump() {
 }
 
 fn_status_servicos() {
-    local servicos=(unbound monitor-unbound zabbix-agent2 krill routinator ookla nperf-server rota-persistente)
-    local nomes=("DNS Unbound" "Monitor Unbound" "Zabbix-Agent2" "Krill" "Routinator" "Ookla" "nPerf" "Rota Persistente")
     local msg=""
 
-    for i in "${!servicos[@]}"; do
-        if systemctl is-active --quiet "${servicos[$i]}" 2>/dev/null; then
-            status="ATIVO"
-        elif systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${servicos[$i]}.service"; then
-            status="INATIVO"
-        else
-            status="NAO INSTALADO"
-        fi
-        msg+="$(printf '%-20s %s\n' "${nomes[$i]}" "$status")"$'\n'
-    done
+    while IFS= read -r linha; do
+        svc=$(echo "$linha" | awk '{print $1}' | sed 's/\.service//')
+        status=$(echo "$linha" | awk '{print $3}')
+        msg+="$(printf '%-35s %s\n' "$svc" "$status")"$'\n'
+    done < <(systemctl list-units --type=service --no-legend --no-pager 2>/dev/null)
 
-    whiptail --title "Status dos Servicos" --msgbox "$msg" 20 55
+    whiptail --title "Status dos Servicos" --msgbox "$msg" 30 70
 }
 
 fn_reiniciar_servico() {
