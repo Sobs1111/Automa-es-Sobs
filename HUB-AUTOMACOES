@@ -931,36 +931,327 @@ fn_speedtest() {
     done
 }
 
+fn_adicionar_usuario() {
+    nome=$(whiptail --title "Adicionar Usuario" \
+        --inputbox "Nome do novo usuario:" 8 50 \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$nome" ]] && return 1
+
+    senha=$(whiptail --title "Adicionar Usuario" \
+        --passwordbox "Senha para $nome:" 8 50 \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$senha" ]] && return 1
+
+    nivel=$(whiptail --title "Adicionar Usuario - Permissao" \
+        --menu "Selecione o nivel de permissao:" 14 60 3 \
+        "1" "Usuario padrao (sem privilegios extras)" \
+        "2" "Sudo com senha" \
+        "3" "Sudo sem senha" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    if id "$nome" &>/dev/null; then
+        whiptail --title "Erro" --msgbox "Usuario '$nome' ja existe." 8 50
+        return 1
+    fi
+
+    useradd -m -s /bin/bash "$nome"
+    echo "$nome:$senha" | chpasswd
+
+    case "$nivel" in
+        2)
+            usermod -aG sudo "$nome"
+            ;;
+        3)
+            usermod -aG sudo "$nome"
+            echo "$nome ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$nome
+            chmod 0440 /etc/sudoers.d/$nome
+            ;;
+    esac
+
+    local desc
+    case "$nivel" in
+        1) desc="Usuario padrao" ;;
+        2) desc="Sudo com senha" ;;
+        3) desc="Sudo sem senha" ;;
+    esac
+
+    whiptail --title "Concluido" --msgbox "Usuario criado com sucesso.\n\n  Usuario    : $nome\n  Permissao  : $desc" 10 50
+}
+
+fn_requisitos() {
+    cpu_modelo=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')
+    cpu_nucleos=$(nproc)
+    cpu_uso=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d. -f1)
+
+    ram_total=$(awk '/MemTotal/ {printf "%.1f", $2/1024/1024}' /proc/meminfo)
+    ram_livre=$(awk '/MemAvailable/ {printf "%.1f", $2/1024/1024}' /proc/meminfo)
+    ram_usada=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf "%.1f", (t-a)/1024/1024}' /proc/meminfo)
+
+    disco_total=$(df -h / | awk 'NR==2 {print $2}')
+    disco_usado=$(df -h / | awk 'NR==2 {print $3}')
+    disco_livre=$(df -h / | awk 'NR==2 {print $4}')
+    disco_pct=$(df / | awk 'NR==2 {print $5}')
+
+    whiptail --title "Requisitos da Maquina" --msgbox \
+"PROCESSADOR
+  Modelo  : $cpu_modelo
+  Nucleos : $cpu_nucleos
+  Uso     : ${cpu_uso}%
+
+MEMORIA RAM
+  Total   : ${ram_total} GB
+  Em uso  : ${ram_usada} GB
+  Livre   : ${ram_livre} GB
+
+ARMAZENAMENTO (/)
+  Total   : $disco_total
+  Em uso  : $disco_usado ($disco_pct)
+  Livre   : $disco_livre" 22 60
+}
+
+fn_tcpdump() {
+    which tcpdump &>/dev/null || apt-get install -y tcpdump
+
+    mapfile -t interfaces < <(ip link show | awk -F': ' '/^[0-9]+: / && !/lo/ {print $2}' | awk '{print $1}')
+    local iface_opts=("any" "Todas as interfaces")
+    for iface_item in "${interfaces[@]}"; do
+        iface_opts+=("$iface_item" "")
+    done
+
+    iface=$(whiptail --title "tcpdump - Interface" \
+        --menu "Selecione a interface:" 20 60 8 \
+        "${iface_opts[@]}" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    proto=$(whiptail --title "tcpdump - Protocolo" \
+        --menu "Selecione o protocolo:" 14 50 4 \
+        "1" "Todos" \
+        "2" "TCP" \
+        "3" "UDP" \
+        "4" "ICMP" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    porta=$(whiptail --title "tcpdump - Porta" \
+        --inputbox "Porta (deixe vazio para ignorar):" 8 50 \
+        3>&1 1>&2 2>&3)
+
+    origem=$(whiptail --title "tcpdump - Origem" \
+        --inputbox "IP ou host de origem (deixe vazio para ignorar):" 8 60 \
+        3>&1 1>&2 2>&3)
+
+    destino=$(whiptail --title "tcpdump - Destino" \
+        --inputbox "IP ou host de destino (deixe vazio para ignorar):" 8 60 \
+        3>&1 1>&2 2>&3)
+
+    modo=$(whiptail --title "tcpdump - Modo" \
+        --menu "Como deseja capturar:" 12 50 2 \
+        "1" "Exibir no terminal" \
+        "2" "Salvar em /tmp/captura.pcap" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    local filtro=""
+    case "$proto" in
+        2) filtro="tcp" ;;
+        3) filtro="udp" ;;
+        4) filtro="icmp" ;;
+    esac
+
+    [[ -n "$porta" ]] && filtro+="${filtro:+ and }port $porta"
+    [[ -n "$origem" ]] && filtro+="${filtro:+ and }src host $origem"
+    [[ -n "$destino" ]] && filtro+="${filtro:+ and }dst host $destino"
+
+    local cmd="tcpdump -i $iface -n"
+    [[ -n "$filtro" ]] && cmd+=" '$filtro'"
+    [[ "$modo" == "2" ]] && cmd+=" -w /tmp/captura.pcap"
+
+    whiptail --title "tcpdump" --msgbox "Iniciando captura. Pressione Ctrl+C para encerrar.\n\nComando: $cmd" 10 70
+
+    eval "$cmd"
+
+    [[ "$modo" == "2" ]] && whiptail --title "Concluido" --msgbox "Captura salva em /tmp/captura.pcap" 8 50
+}
+
+fn_status_servicos() {
+    local servicos=(unbound monitor-unbound zabbix-agent2 krill routinator ookla nperf-server rota-persistente)
+    local nomes=("DNS Unbound" "Monitor Unbound" "Zabbix-Agent2" "Krill" "Routinator" "Ookla" "nPerf" "Rota Persistente")
+    local msg=""
+
+    for i in "${!servicos[@]}"; do
+        if systemctl is-active --quiet "${servicos[$i]}" 2>/dev/null; then
+            status="ATIVO"
+        elif systemctl list-unit-files "${servicos[$i]}.service" &>/dev/null | grep -q "${servicos[$i]}"; then
+            status="INATIVO"
+        else
+            status="NAO INSTALADO"
+        fi
+        msg+="$(printf '%-20s %s\n' "${nomes[$i]}" "$status")"$'\n'
+    done
+
+    whiptail --title "Status dos Servicos" --msgbox "$msg" 20 55
+}
+
+fn_reiniciar_servico() {
+    local servicos=(unbound monitor-unbound zabbix-agent2 krill routinator ookla nperf-server rota-persistente)
+    local nomes=("DNS Unbound" "Monitor Unbound" "Zabbix-Agent2" "Krill" "Routinator" "Ookla" "nPerf" "Rota Persistente")
+
+    local opts=()
+    for i in "${!servicos[@]}"; do
+        if systemctl list-unit-files "${servicos[$i]}.service" &>/dev/null | grep -q "${servicos[$i]}"; then
+            opts+=("${servicos[$i]}" "${nomes[$i]}")
+        fi
+    done
+
+    if [[ ${#opts[@]} -eq 0 ]]; then
+        whiptail --title "Reiniciar Servico" --msgbox "Nenhum servico gerenciado encontrado." 8 50
+        return 1
+    fi
+
+    svc=$(whiptail --title "Reiniciar Servico" \
+        --menu "Selecione o servico para reiniciar:" 20 60 8 \
+        "${opts[@]}" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    systemctl restart "$svc"
+
+    if systemctl is-active --quiet "$svc"; then
+        whiptail --title "Concluido" --msgbox "Servico '$svc' reiniciado com sucesso." 8 50
+    else
+        whiptail --title "Erro" --msgbox "Falha ao reiniciar '$svc'. Verifique com:\nsystemctl status $svc" 10 60
+    fi
+}
+
+fn_remover_usuario() {
+    mapfile -t usuarios < <(awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd)
+
+    if [[ ${#usuarios[@]} -eq 0 ]]; then
+        whiptail --title "Remover Usuario" --msgbox "Nenhum usuario comum encontrado." 8 50
+        return 1
+    fi
+
+    local opts=()
+    for u in "${usuarios[@]}"; do
+        opts+=("$u" "")
+    done
+
+    nome=$(whiptail --title "Remover Usuario" \
+        --menu "Selecione o usuario a remover:" 20 50 8 \
+        "${opts[@]}" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    whiptail --title "Remover Usuario" \
+        --yesno "Deseja remover tambem o diretorio home de '$nome'?" 8 55
+    local remover_home=$?
+
+    whiptail --title "Confirmacao" \
+        --yesno "Confirmar remocao do usuario '$nome'?" 8 50
+    [[ $? -ne 0 ]] && return 1
+
+    if [[ $remover_home -eq 0 ]]; then
+        userdel -r "$nome" 2>/dev/null
+    else
+        userdel "$nome" 2>/dev/null
+    fi
+
+    rm -f /etc/sudoers.d/"$nome"
+
+    whiptail --title "Concluido" --msgbox "Usuario '$nome' removido com sucesso." 8 50
+}
+
+fn_gerencia_usuarios() {
+    while true; do
+        choice=$(whiptail --title "Gerencia de Usuarios" \
+            --menu "Selecione uma opcao:" 14 50 4 \
+            "1" "Adicionar Usuario" \
+            "2" "Remover Usuario" \
+            "3" "Alterar Senha" \
+            "4" "Voltar" \
+            3>&1 1>&2 2>&3)
+
+        [[ $? -ne 0 ]] && return 0
+
+        case "$choice" in
+            1) fn_adicionar_usuario ;;
+            2) fn_remover_usuario ;;
+            3) fn_alterar_senha ;;
+            4) return 0 ;;
+        esac
+    done
+}
+
+fn_alterar_senha() {
+    mapfile -t usuarios < <(awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd)
+
+    if [[ ${#usuarios[@]} -eq 0 ]]; then
+        whiptail --title "Alterar Senha" --msgbox "Nenhum usuario comum encontrado." 8 50
+        return 1
+    fi
+
+    local opts=()
+    for u in "${usuarios[@]}"; do
+        opts+=("$u" "")
+    done
+
+    nome=$(whiptail --title "Alterar Senha" \
+        --menu "Selecione o usuario:" 20 50 8 \
+        "${opts[@]}" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    senha=$(whiptail --title "Alterar Senha" \
+        --passwordbox "Nova senha para '$nome':" 8 50 \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$senha" ]] && return 1
+
+    echo "$nome:$senha" | chpasswd
+    whiptail --title "Concluido" --msgbox "Senha do usuario '$nome' alterada com sucesso." 8 55
+}
+
 menu() {
     while true; do
         choice=$(whiptail --title "Hub de Configuracoes" \
-            --menu "Selecione uma opcao:" 26 65 11 \
-            "1" "Instalar DNS Unbound Recursivo" \
-            "2" "Instalar DNS Unbound Reverso" \
-            "3" "Instalar Monitor do Unbound" \
-            "4" "Instalar Zabbix-Agent2 Padrao" \
-            "5" "Instalar Zabbix-Agent2 com Monitoramento Unbound" \
-            "6" "Instalar e configurar iptables" \
-            "7" "Instalar Krill e Routinator (RPKI)" \
-            "8" "Configurar Rota Default com Origem Publica" \
-            "9" "Instalar Servidores de velocidade (Ookla, Nperf e MC)" \
-            "10" "Sair" \
+            --menu "Selecione uma opcao:" 32 65 16 \
+            "1"  "Instalar DNS Unbound Recursivo" \
+            "2"  "Instalar DNS Unbound Reverso" \
+            "3"  "Instalar Monitor do Unbound" \
+            "4"  "Instalar Zabbix-Agent2 Padrao" \
+            "5"  "Instalar Zabbix-Agent2 com Monitoramento Unbound" \
+            "6"  "Instalar e configurar iptables" \
+            "7"  "Instalar Krill e Routinator (RPKI)" \
+            "8"  "Configurar Rota Default com Origem Publica" \
+            "9"  "Instalar Servidores de velocidade (Ookla, Nperf e MC)" \
+            "10" "Gerencia de Usuarios" \
+            "11" "Verificar Requisitos da Maquina" \
+            "12" "Captura de Pacotes (tcpdump)" \
+            "13" "Status dos Servicos" \
+            "14" "Reiniciar Servico" \
+            "15" "Sair" \
             3>&1 1>&2 2>&3)
 
         exitstatus=$?
         [[ $exitstatus -ne 0 ]] && exit 0
 
         case "$choice" in
-            1) fn_instalar_recursivo ;;
-            2) fn_reverso ;;
-            3) fn_monitor_unbound ;;
-            4) fn_zabbix_comum ;;
-            5) fn_zabbix_unbound ;;
-            6) fn_iptables ;;
-            7) fn_rpki ;;
-            8) fn_rota_persistente ;;
-            9) fn_speedtest ;;
-            10) exit 0 ;;
+            1)  fn_instalar_recursivo ;;
+            2)  fn_reverso ;;
+            3)  fn_monitor_unbound ;;
+            4)  fn_zabbix_comum ;;
+            5)  fn_zabbix_unbound ;;
+            6)  fn_iptables ;;
+            7)  fn_rpki ;;
+            8)  fn_rota_persistente ;;
+            9)  fn_speedtest ;;
+            10) fn_gerencia_usuarios ;;
+            11) fn_requisitos ;;
+            12) fn_tcpdump ;;
+            13) fn_status_servicos ;;
+            14) fn_reiniciar_servico ;;
+            15) exit 0 ;;
         esac
     done
 }
