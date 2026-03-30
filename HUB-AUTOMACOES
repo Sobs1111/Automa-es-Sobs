@@ -1,0 +1,967 @@
+#!/bin/bash
+
+if [[ $EUID -ne 0 ]]; then
+    echo "Este script precisa ser executado como root"
+    exit 1
+fi
+
+is_private_ip() {
+    local ip=$1
+    [[ "$ip" =~ ^10\. ]] && return 0
+    [[ "$ip" =~ ^192\.168\. ]] && return 0
+    [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] && return 0
+    return 1
+}
+
+detectar_ips() {
+    mapfile -t ipv4_list < <(ip -4 addr show | awk '/inet / {print $2}' | cut -d/ -f1)
+    mapfile -t ipv6_list < <(ip -6 addr show | awk '/inet6 / {print $2}' | cut -d/ -f1 | grep -v '^fe80')
+}
+
+confirmar_ips() {
+    detectar_ips
+    local msg="Enderecos detectados:\n\nIPv4:\n"
+    for ip in "${ipv4_list[@]}"; do msg+="  $ip\n"; done
+    msg+="\nIPv6:\n"
+    for ip in "${ipv6_list[@]}"; do msg+="  $ip\n"; done
+    msg+="\nDeseja prosseguir com esses enderecos?"
+    whiptail --title "Enderecos Detectados" --yesno "$msg" 20 60
+    [[ $? -ne 0 ]] && return 1
+    return 0
+}
+
+detectar_tier() {
+    cpu_count=$(nproc)
+    ram_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
+
+    if (( cpu_count <= 4 )); then tier_cpu="baixo"
+    elif (( cpu_count <= 10 )); then tier_cpu="medio"
+    else tier_cpu="alto"; fi
+
+    if (( ram_gb < 6 )); then tier_ram="baixo"
+    elif (( ram_gb <= 16 )); then tier_ram="medio"
+    else tier_ram="alto"; fi
+
+    tier_order() { case $1 in baixo) echo 1;; medio) echo 2;; alto) echo 3;; esac; }
+
+    if (( $(tier_order "$tier_cpu") < $(tier_order "$tier_ram") )); then
+        tier="$tier_cpu"
+    else
+        tier="$tier_ram"
+    fi
+
+    echo "Hardware detectado: ${cpu_count} vCPU | ${ram_gb} GB RAM"
+    echo "Faixa de otimizacao aplicada: ${tier}"
+
+    case "$tier" in
+        baixo)
+            t_threads=2; t_slabs=2; t_rrset="512m"; t_msg="256m"
+            t_range=1024; t_qpt=1024; t_otcp=256; t_itcp=512
+            ;;
+        medio)
+            t_threads=8; t_slabs=4; t_rrset="2g"; t_msg="1g"
+            t_range=6144; t_qpt=4096; t_otcp=1024; t_itcp=2048
+            ;;
+        alto)
+            t_threads=16; t_slabs=8; t_rrset="4g"; t_msg="2g"
+            t_range=8192; t_qpt=8192; t_otcp=2048; t_itcp=4096
+            ;;
+    esac
+}
+
+instalar_unbound_base() {
+    apt install rsyslog ssh net-tools dnsutils unbound -y
+
+    cat > /etc/unbound/acl.conf <<EOF
+access-control: ::/0 allow
+access-control: 0.0.0.0/0 allow
+EOF
+
+    touch /etc/unbound/blacklist.conf
+    touch /etc/unbound/local_zone.conf
+}
+
+gerar_config_unbound() {
+    local outgoing_ip="$1"
+    config_file="/etc/unbound/unbound.conf.d/server.conf"
+    {
+        echo "server:"
+        echo "    use-syslog: yes"
+        echo "    username: \"unbound\""
+        echo "    directory: \"/etc/unbound\""
+        echo "    do-ip6: yes"
+        echo "    do-ip4: yes"
+        for ip in "${ipv4_list[@]}"; do echo "    interface: $ip"; done
+        for ip in "${ipv6_list[@]}"; do echo "    interface: $ip"; done
+        echo "    verbosity: 0"
+        echo "    port: 53"
+        echo "    log-replies: no"
+        echo "    root-hints: /usr/share/dns/root.hints"
+        echo "    harden-dnssec-stripped: yes"
+        echo "    extended-statistics: yes"
+        echo "    statistics-cumulative: no"
+        echo "    include: /etc/unbound/local_zone.conf"
+        echo "    include: /etc/unbound/blacklist.conf"
+        echo "    include: /etc/unbound/acl.conf"
+        echo "    num-threads: $t_threads"
+        echo "    msg-cache-slabs: $t_slabs"
+        echo "    rrset-cache-slabs: $t_slabs"
+        echo "    infra-cache-slabs: $t_slabs"
+        echo "    key-cache-slabs: $t_slabs"
+        echo "    rrset-cache-size: $t_rrset"
+        echo "    msg-cache-size: $t_msg"
+        echo "    outgoing-range: $t_range"
+        echo "    so-rcvbuf: 4m"
+        echo "    so-sndbuf: 4m"
+        echo "    so-reuseport: yes"
+        echo "    prefetch: yes"
+        echo "    prefetch-key: yes"
+        echo "    hide-identity: yes"
+        echo "    hide-version: yes"
+        echo "    unwanted-reply-threshold: 10000000"
+        echo "    deny-any: yes"
+        echo "    num-queries-per-thread: $t_qpt"
+        echo "    outgoing-num-tcp: $t_otcp"
+        echo "    incoming-num-tcp: $t_itcp"
+        echo "    minimal-responses: yes"
+        echo "    edns-buffer-size: 1232"
+        [[ -n "$outgoing_ip" ]] && echo "    outgoing-interface: $outgoing_ip"
+    } > "$config_file"
+}
+
+aplicar_sysctl() {
+    cat > /etc/sysctl.d/99-unbound.conf <<EOF
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.rmem_default = 16777216
+net.core.wmem_default = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.netdev_max_backlog = 32768
+net.core.somaxconn = 4096
+net.ipv4.udp_mem = 8388608 12582912 16777216
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.ipv4.ip_local_port_range = 10000 65535
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_tw_reuse = 1
+vm.swappiness = 10
+fs.file-max = 2097152
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.default.forwarding = 0
+EOF
+    sysctl -p /etc/sysctl.d/99-unbound.conf
+}
+
+fn_monitor_unbound_silencioso() {
+    cat > /usr/local/bin/monitor_unbound.sh <<'MONITOR'
+#!/bin/bash
+SERVICE="unbound"
+LOG_FILE="/var/log/monitor_unbound.log"
+MAX_RESTARTS=3
+WINDOW_SECONDS=900
+CHECK_INTERVAL=120
+RESTART_TIMESTAMPS=()
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+purge_old_timestamps() {
+    local now
+    now=$(date +%s)
+    local fresh=()
+    for ts in "${RESTART_TIMESTAMPS[@]}"; do
+        (( now - ts < WINDOW_SECONDS )) && fresh+=("$ts")
+    done
+    RESTART_TIMESTAMPS=("${fresh[@]}")
+}
+
+is_healthy() {
+    local state
+    state=$(systemctl is-active "$SERVICE" 2>/dev/null)
+    [[ "$state" == "active" || "$state" == "running" ]]
+}
+
+try_restart() {
+    purge_old_timestamps
+    local count=${#RESTART_TIMESTAMPS[@]}
+    if (( count >= MAX_RESTARTS )); then
+        log "AVISO: limite de $MAX_RESTARTS restarts em ${WINDOW_SECONDS}s atingido. Restart bloqueado."
+        return 1
+    fi
+    log "Reiniciando $SERVICE (restart $((count + 1)) de $MAX_RESTARTS na janela atual)..."
+    if systemctl restart "$SERVICE"; then
+        RESTART_TIMESTAMPS+=("$(date +%s)")
+        log "Servico $SERVICE reiniciado com sucesso."
+    else
+        RESTART_TIMESTAMPS+=("$(date +%s)")
+        log "ERRO: falha ao reiniciar $SERVICE. Verifique manualmente."
+    fi
+}
+
+log "=========================================="
+log "Monitor iniciado | intervalo: ${CHECK_INTERVAL}s | max restarts: ${MAX_RESTARTS}/${WINDOW_SECONDS}s"
+log "=========================================="
+
+while true; do
+    if is_healthy; then
+        log "OK: $SERVICE esta ativo e saudavel."
+    else
+        STATE=$(systemctl is-active "$SERVICE" 2>/dev/null)
+        log "ALERTA: $SERVICE esta com estado '$STATE'. Tentando restart..."
+        try_restart
+    fi
+    sleep "$CHECK_INTERVAL"
+done
+MONITOR
+
+    cat > /etc/systemd/system/monitor-unbound.service <<EOF
+[Unit]
+Description=Monitor do servico Unbound
+After=network.target unbound.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/monitor_unbound.sh
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chmod +x /usr/local/bin/monitor_unbound.sh
+    systemctl daemon-reload
+    systemctl enable --now monitor-unbound
+}
+
+fn_instalar_recursivo() {
+    confirmar_ips || return
+
+    outgoing_ip=""
+    default_gw=$(ip route show default | awk '/default via/ {print $3; exit}')
+
+    if [[ -n "$default_gw" ]] && is_private_ip "$default_gw"; then
+        mapfile -t public_ipv4s < <(ip -4 addr show | awk '/inet / {print $2}' | cut -d/ -f1 | while read -r ip; do
+            { is_private_ip "$ip" || [[ "$ip" =~ ^127\. ]]; } && continue
+            echo "$ip"
+        done)
+
+        if [[ ${#public_ipv4s[@]} -gt 0 ]]; then
+            local pub_opts=()
+            for pub_ip in "${public_ipv4s[@]}"; do
+                pub_opts+=("$pub_ip" "")
+            done
+            outgoing_ip=$(whiptail --title "Outgoing Interface" \
+                --menu "Gateway privado detectado ($default_gw).\nSelecione o IP publico para outgoing-interface:" 20 60 8 \
+                "${pub_opts[@]}" \
+                3>&1 1>&2 2>&3)
+            [[ $? -ne 0 ]] && return 1
+        fi
+    fi
+
+    instalar_unbound_base
+    detectar_tier
+    gerar_config_unbound "$outgoing_ip"
+    aplicar_sysctl
+    fn_monitor_unbound_silencioso
+    systemctl restart unbound
+    whiptail --title "Concluido" --msgbox "Unbound recursivo instalado e configurado.\nServico de monitoramento instalado automaticamente." 10 60
+    pos_dns
+}
+
+fn_reverso() {
+    if ! systemctl is-active --quiet unbound 2>/dev/null; then
+        whiptail --title "Aviso" --msgbox "Unbound nao detectado. Sera executada a instalacao base antes de configurar a zona reversa." 10 60
+        confirmar_ips || return
+        outgoing_ip=""
+        instalar_unbound_base
+        detectar_tier
+        gerar_config_unbound "$outgoing_ip"
+        aplicar_sysctl
+    else
+        detectar_ips
+    fi
+
+    fn_monitor_unbound_silencioso
+    whiptail --title "Aviso" --msgbox "Servico de monitoramento do Unbound instalado automaticamente." 8 60
+
+    OUTPUT="/etc/unbound/local_zone.conf"
+
+    ip2int() {
+        local a b c d
+        IFS=. read -r a b c d <<< "$1"
+        echo $(( (a << 24) | (b << 16) | (c << 8) | d ))
+    }
+
+    expand_ipv6() {
+        local ip="$1"
+        if [[ "$ip" == *"::"* ]]; then
+            local left="${ip%%::*}"
+            local right="${ip##*::}"
+            local left_count=0 right_count=0
+            [[ -n "$left" ]]  && left_count=$(awk -F: '{print NF}' <<< "$left")
+            [[ -n "$right" ]] && right_count=$(awk -F: '{print NF}' <<< "$right")
+            local missing=$(( 8 - left_count - right_count ))
+            local zeros=""
+            for ((i=0; i<missing; i++)); do zeros="${zeros}0000:"; done
+            [[ -n "$left" ]]  && ip="${left}:${zeros}" || ip="${zeros}"
+            [[ -n "$right" ]] && ip="${ip}${right}"    || ip="${ip%:}"
+        fi
+        local expanded=""
+        IFS=: read -ra groups <<< "$ip"
+        for g in "${groups[@]}"; do
+            expanded="${expanded}$(printf '%04x' "0x${g}"):"
+        done
+        echo "${expanded%:}"
+    }
+
+    ipv6_reverse_zone() {
+        local flat="${1//:}"
+        local nibbles=$(( $2 / 4 ))
+        local prefix="${flat:0:$nibbles}"
+        local rev=""
+        for ((i=${#prefix}-1; i>=0; i--)); do rev="${rev}${prefix:$i:1}."; done
+        echo "${rev}ip6.arpa."
+    }
+
+    declare -a cidrs
+    while true; do
+        cidr=$(whiptail --title "Zona Reversa IPv4" \
+            --inputbox "Bloco IPv4 CIDR (ex: 192.168.0.0/22)\nDeixe vazio para finalizar:" 10 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$cidr" ]] && break
+        cidrs+=("$cidr")
+    done
+
+    domain=$(whiptail --title "Zona Reversa" \
+        --inputbox "Dominio padrao (ex: provedor.com.br):" 10 60 \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    declare -A special_ips
+    while true; do
+        sip=$(whiptail --title "IPs Especiais" \
+            --inputbox "IP especial com hostname personalizado\nDeixe vazio para finalizar:" 10 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$sip" ]] && break
+        shost=$(whiptail --title "IPs Especiais" \
+            --inputbox "Hostname para $sip:" 10 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && break
+        special_ips["$sip"]="$shost"
+    done
+
+    ipv6_cidr=$(whiptail --title "Zona Reversa IPv6" \
+        --inputbox "Prefixo IPv6 com mascara (ex: 2001:db8::/32)\nDeixe vazio para ignorar:" 10 60 \
+        3>&1 1>&2 2>&3)
+
+    declare -A ipv6_special
+    ipv6_zone=""
+    if [[ -n "$ipv6_cidr" ]]; then
+        ipv6_addr="${ipv6_cidr%/*}"
+        ipv6_len="${ipv6_cidr#*/}"
+        ipv6_expanded=$(expand_ipv6 "$ipv6_addr")
+        ipv6_zone=$(ipv6_reverse_zone "$ipv6_expanded" "$ipv6_len")
+        whiptail --title "Zona IPv6" --msgbox "Zona IPv6 gerada: $ipv6_zone" 8 60
+        while true; do
+            sip6=$(whiptail --title "IPs IPv6 Especiais" \
+                --inputbox "IPv6 especial com hostname personalizado\nDeixe vazio para finalizar:" 10 60 \
+                3>&1 1>&2 2>&3)
+            [[ $? -ne 0 || -z "$sip6" ]] && break
+            shost6=$(whiptail --title "IPs IPv6 Especiais" \
+                --inputbox "Hostname para $sip6:" 10 60 \
+                3>&1 1>&2 2>&3)
+            [[ $? -ne 0 ]] && break
+            ipv6_special["$sip6"]="$shost6"
+        done
+    fi
+
+    > "$OUTPUT"
+    current_24=""
+
+    for cidr in "${cidrs[@]}"; do
+        ip_part="${cidr%/*}"
+        prefix="${cidr#*/}"
+        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+        start=$(( $(ip2int "$ip_part") & mask ))
+        end=$(( start | (~mask & 0xFFFFFFFF) ))
+
+        for (( i=start; i<=end; i++ )); do
+            a=$(( (i >> 24) & 255 ))
+            b=$(( (i >> 16) & 255 ))
+            c=$(( (i >> 8)  & 255 ))
+            d=$(( i & 255 ))
+            current_ip="${a}.${b}.${c}.${d}"
+            this_24="${a}.${b}.${c}"
+
+            if [[ "$this_24" != "$current_24" ]]; then
+                [[ -n "$current_24" ]] && echo "" >> "$OUTPUT"
+                echo "#---------------------------------ZONA ${this_24}------------------------------------" >> "$OUTPUT"
+                echo "" >> "$OUTPUT"
+                echo "local-zone: \"${c}.${b}.${a}.in-addr.arpa.\" transparent" >> "$OUTPUT"
+                echo "local-data: \"${c}.${b}.${a}.in-addr.arpa 10800 IN SOA hostmaster. nobody.invalid. 1 3600 1200 604800 10800\"" >> "$OUTPUT"
+                echo "" >> "$OUTPUT"
+                current_24="$this_24"
+            fi
+
+            if [[ -n "${special_ips[$current_ip]}" ]]; then
+                hostname="${special_ips[$current_ip]}"
+            else
+                hostname="${a}-${b}-${c}-${d}.${domain}"
+            fi
+
+            echo "local-data-ptr: \"${current_ip} ${hostname}\"" >> "$OUTPUT"
+        done
+    done
+
+    if [[ -n "$ipv6_zone" ]]; then
+        {
+            echo ""
+            echo "#===========================================ZONA REVERSA IPv6========================================="
+            echo ""
+            echo "local-zone: \"${ipv6_zone}\" transparent"
+            echo "local-data: \"${ipv6_zone%.} 10800 IN SOA hostmaster. nobody.invalid. 1 3600 1200 604800 10800\""
+            echo ""
+        } >> "$OUTPUT"
+        for sip6 in "${!ipv6_special[@]}"; do
+            echo "local-data-ptr: \"${sip6} ${ipv6_special[$sip6]}\"" >> "$OUTPUT"
+        done
+    fi
+
+    if unbound-checkconf > /dev/null 2>&1; then
+        systemctl restart unbound
+        whiptail --title "Concluido" --msgbox "Arquivo gerado: $OUTPUT\nUnbound reiniciado com sucesso." 10 60
+    else
+        local erros
+        erros=$(unbound-checkconf 2>&1)
+        whiptail --title "Erro de Configuracao" --msgbox "$erros" 20 70
+    fi
+
+    pos_dns
+}
+
+fn_monitor_unbound() {
+    fn_monitor_unbound_silencioso
+    whiptail --title "Concluido" --msgbox "Servico de monitoramento do Unbound instalado e ativado." 8 60
+}
+
+fn_iptables() {
+    local contexto="$1"
+
+    apt install iptables iptables-persistent -y
+
+    declare -a ssh_origins
+    while true; do
+        ssh_src=$(whiptail --title "iptables - SSH" \
+            --inputbox "Origem permitida para SSH (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$ssh_src" ]] && break
+        ssh_origins+=("$ssh_src")
+    done
+
+    iptables -F
+    iptables -P INPUT DROP
+    iptables -P FORWARD DROP
+    iptables -P OUTPUT ACCEPT
+
+    iptables -A INPUT -i lo -j ACCEPT
+    iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+    iptables -A INPUT -p icmp -j ACCEPT
+    iptables -A OUTPUT -p icmp -j ACCEPT
+
+    for src in "${ssh_origins[@]}"; do
+        iptables -A INPUT -p tcp -s "$src" --dport 22 -j ACCEPT
+    done
+
+    case "$contexto" in
+        dns)
+            iptables -A INPUT -p tcp --dport 53 -j ACCEPT
+            iptables -A INPUT -p udp --dport 53 -j ACCEPT
+            ;;
+        rpki)
+            iptables -A INPUT -p tcp --dport 3000 -j ACCEPT
+            iptables -A INPUT -p tcp --dport 8323 -j ACCEPT
+            iptables -A INPUT -p tcp --dport 3323 -j ACCEPT
+            ;;
+    esac
+
+    if systemctl is-active --quiet zabbix-agent2 2>/dev/null; then
+        zabbix_src=$(whiptail --title "iptables - Zabbix" \
+            --inputbox "Origem para porta 10050 do Zabbix (CIDR ou IP):" 10 60 \
+            3>&1 1>&2 2>&3)
+        if [[ $? -eq 0 && -n "$zabbix_src" ]]; then
+            iptables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
+            iptables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
+        fi
+    fi
+
+    netfilter-persistent save
+    whiptail --title "Concluido" --msgbox "Regras de iptables aplicadas e salvas." 8 50
+}
+
+preparar_zabbix() {
+    if dpkg -l zabbix-agent 2>/dev/null | grep -q '^ii'; then
+        whiptail --title "Zabbix" --msgbox "zabbix-agent (v1) detectado. Sera removido antes da instalacao do zabbix-agent2." 8 60
+        apt remove zabbix-agent -y
+        apt autoremove -y
+    fi
+
+    if dpkg -l zabbix-agent2 2>/dev/null | grep -q '^ii'; then
+        whiptail --title "Zabbix" --msgbox "zabbix-agent2 ja esta instalado. Sera feita apenas a configuracao." 8 60
+        return 0
+    fi
+
+    apt install zabbix-agent2 -y
+}
+
+fn_zabbix_comum() {
+    preparar_zabbix
+    sys_hostname=$(hostname)
+    sed -i "s/^Server=.*/Server=0.0.0.0\/0/" /etc/zabbix/zabbix_agent2.conf
+    sed -i "s/^Hostname=.*/Hostname=${sys_hostname}/" /etc/zabbix/zabbix_agent2.conf
+    systemctl enable --now zabbix-agent2
+    whiptail --title "Concluido" --msgbox "Zabbix Agent2 configurado.\nHostname: ${sys_hostname}" 8 60
+}
+
+fn_zabbix_unbound() {
+    fn_zabbix_comum
+
+    cat > /etc/unbound/unbound.conf.d/statistics-enable.conf <<EOF
+server:
+    statistics-interval: 0
+    statistics-cumulative: no
+    extended-statistics: yes
+
+remote-control:
+    control-enable: yes
+    control-interface: 127.0.0.1
+    control-port: 8953
+    server-key-file: "/etc/unbound/unbound_server.key"
+    server-cert-file: "/etc/unbound/unbound_server.pem"
+    control-key-file: "/etc/unbound/unbound_control.key"
+    control-cert-file: "/etc/unbound/unbound_control.pem"
+EOF
+
+    unbound-control-setup
+
+    cat > /etc/sudoers.d/zabbix-agent <<EOF
+Defaults:zabbix !requiretty
+zabbix ALL = NOPASSWD: /usr/sbin/unbound-control
+EOF
+
+    chmod 0440 /etc/sudoers.d/zabbix-agent
+    usermod -a -G unbound zabbix
+
+    cat > /etc/zabbix/zabbix_agent2.d/userparameter_unbound.conf <<'EOF'
+UserParameter=unbound.service,systemctl is-active unbound >/dev/null 2>&1 && echo 1 || echo 0
+UserParameter=unbound.service.status,systemctl status unbound --no-pager -l 2>/dev/null | head -3 | tail -1 | awk '{print $2}' || echo "unknown"
+UserParameter=unbound.time.up,sudo /usr/sbin/unbound-control stats_noreset | grep "time.up=" | cut -d= -f2
+UserParameter=unbound.time.now,sudo /usr/sbin/unbound-control stats_noreset | grep "time.now=" | cut -d= -f2
+UserParameter=unbound.time.elapsed,sudo /usr/sbin/unbound-control stats_noreset | grep "time.elapsed=" | cut -d= -f2
+UserParameter=unbound.num.cachehits,sudo /usr/sbin/unbound-control stats_noreset | grep "num.cachehits=" | cut -d= -f2
+UserParameter=unbound.num.cachemiss,sudo /usr/sbin/unbound-control stats_noreset | grep "num.cachemiss=" | cut -d= -f2
+UserParameter=unbound.cache.hitrate,sudo /usr/sbin/unbound-control stats_noreset | awk '/num.cachehits=/{h=$2} /num.cachemiss=/{m=$2} END{total=h+m; if(total>0) printf "%.2f", (h/total)*100; else print 0}' FS='='
+UserParameter=unbound.cache.size,sudo /usr/sbin/unbound-control stats_noreset | grep "msg.cache.count=" | cut -d= -f2
+UserParameter=unbound.rrset.cache.size,sudo /usr/sbin/unbound-control stats_noreset | grep "rrset.cache.count=" | cut -d= -f2
+UserParameter=unbound.mem.total,sudo /usr/sbin/unbound-control stats_noreset | awk '/^mem\./{sum += $2} END{print sum}' FS='='
+UserParameter=unbound.mem.cache,sudo /usr/sbin/unbound-control stats_noreset | grep "mem.cache.message=" | cut -d= -f2
+UserParameter=unbound.mem.cache.rrset,sudo /usr/sbin/unbound-control stats_noreset | grep "mem.cache.rrset=" | cut -d= -f2
+UserParameter=unbound.total.queries,sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.queries=" | cut -d= -f2
+UserParameter=unbound.total.cachehits,sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.cachehits=" | cut -d= -f2
+UserParameter=unbound.total.cachemiss,sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.cachemiss=" | cut -d= -f2
+UserParameter=unbound.num.queries.sent,sudo /usr/sbin/unbound-control stats_noreset | grep "num.queries.sent=" | cut -d= -f2
+UserParameter=unbound.num.query.recurse,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.recurse=" | cut -d= -f2
+UserParameter=unbound.num.query.edns,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.edns=" | cut -d= -f2
+UserParameter=unbound.num.query.dnssec,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.dnssec=" | cut -d= -f2
+UserParameter=unbound.num.prefetch,sudo /usr/sbin/unbound-control stats_noreset | grep "num.prefetch=" | cut -d= -f2
+UserParameter=unbound.num.expired,sudo /usr/sbin/unbound-control stats_noreset | grep "num.expired=" | cut -d= -f2
+UserParameter=unbound.num.recursivereplies,sudo /usr/sbin/unbound-control stats_noreset | grep "num.recursivereplies=" | cut -d= -f2
+UserParameter=unbound.num.query.flagQR,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagQR=" | cut -d= -f2
+UserParameter=unbound.num.query.flagAA,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagAA=" | cut -d= -f2
+UserParameter=unbound.num.query.flagTC,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagTC=" | cut -d= -f2
+UserParameter=unbound.num.query.flagRD,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagRD=" | cut -d= -f2
+UserParameter=unbound.num.query.flagRA,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagRA=" | cut -d= -f2
+UserParameter=unbound.num.query.flagAD,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagAD=" | cut -d= -f2
+UserParameter=unbound.num.query.flagCD,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagCD=" | cut -d= -f2
+UserParameter=unbound.type.A,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.A=" | cut -d= -f2
+UserParameter=unbound.type.AAAA,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.AAAA=" | cut -d= -f2
+UserParameter=unbound.type.MX,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.MX=" | cut -d= -f2
+UserParameter=unbound.type.TXT,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.TXT=" | cut -d= -f2
+UserParameter=unbound.type.PTR,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.PTR=" | cut -d= -f2
+UserParameter=unbound.type.CNAME,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.CNAME=" | cut -d= -f2
+UserParameter=unbound.type.NS,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.NS=" | cut -d= -f2
+UserParameter=unbound.rcode.NOERROR,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.NOERROR=" | cut -d= -f2
+UserParameter=unbound.rcode.NXDOMAIN,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.NXDOMAIN=" | cut -d= -f2
+UserParameter=unbound.rcode.SERVFAIL,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.SERVFAIL=" | cut -d= -f2
+UserParameter=unbound.rcode.REFUSED,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.REFUSED=" | cut -d= -f2
+UserParameter=unbound.class.IN,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.class.IN=" | cut -d= -f2
+UserParameter=unbound.num.answer.secure,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.secure=" | cut -d= -f2
+UserParameter=unbound.num.answer.bogus,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.bogus=" | cut -d= -f2
+UserParameter=unbound.unwanted.queries,sudo /usr/sbin/unbound-control stats_noreset | grep "unwanted.queries=" | cut -d= -f2
+UserParameter=unbound.unwanted.replies,sudo /usr/sbin/unbound-control stats_noreset | grep "unwanted.replies=" | cut -d= -f2
+UserParameter=unbound.process.cpu,ps -C unbound -o pid,pcpu | grep -v PID | awk '{sum += $2} END{print sum}'
+UserParameter=unbound.process.memory,ps -C unbound -o pid,rss | grep -v PID | awk '{sum += $2} END{print sum*1024}'
+UserParameter=unbound.process.count,pgrep -c unbound
+UserParameter=unbound.test.query,timeout 5 dig @127.0.0.1 google.com >/dev/null 2>&1 && echo 1 || echo 0
+UserParameter=unbound.test.response.time,timeout 5 dig @127.0.0.1 google.com | grep "Query time:" | awk '{print $4}' 2>/dev/null || echo 0
+UserParameter=unbound.efficiency,sudo /usr/sbin/unbound-control stats_noreset | awk "/total.num.cachehits=/{h=\$2} /total.num.queries=/{q=\$2} END{if(q>0) printf \"%.2f\", (h/q)*100; else print 0}" FS="="
+UserParameter=unbound.dns.status,systemctl is-active unbound >/dev/null 2>&1 && echo 1 || echo 0
+UserParameter=unbound.query.ipv6,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.ipv6=" | cut -d= -f2
+UserParameter=unbound.stats[*],sudo /usr/sbin/unbound-control stats_noreset | grep "^$1=" | cut -d= -f2
+EOF
+
+    chmod 644 /etc/zabbix/zabbix_agent2.d/userparameter_unbound.conf
+    systemctl restart unbound
+    systemctl restart zabbix-agent2
+    sys_hostname=$(hostname)
+    whiptail --title "Concluido" --msgbox "Zabbix Agent2 com monitoramento do Unbound configurado.\nHostname: ${sys_hostname}" 8 60
+}
+
+pos_dns() {
+    whiptail --title "iptables" --yesno "Deseja configurar o iptables?" 8 50
+    [[ $? -eq 0 ]] && fn_iptables "dns"
+
+    whiptail --title "Zabbix" --yesno "Deseja configurar o Zabbix-Agent2 com monitoramento do Unbound?" 8 60
+    [[ $? -eq 0 ]] && fn_zabbix_unbound
+}
+
+fn_rpki() {
+    echo "=== Configurando timezone para UTC ==="
+    timedatectl set-timezone UTC
+
+    echo "=== Atualizando repositorios e instalando dependencias ==="
+    apt update
+    apt install -y \
+        ca-certificates \
+        curl \
+        gnupg \
+        lsb-release \
+        wget \
+        gnupg2 \
+        apt-transport-https \
+        net-tools \
+        iptables
+
+    echo "=== Adicionando repositorio NLnet Labs ==="
+    curl -fsSL https://packages.nlnetlabs.nl/aptkey.asc | gpg --dearmor -o /usr/share/keyrings/nlnetlabs-archive-keyring.gpg
+
+    echo \
+"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/nlnetlabs-archive-keyring.gpg] https://packages.nlnetlabs.nl/linux/debian \
+$(lsb_release -cs) main" | tee /etc/apt/sources.list.d/nlnetlabs.list > /dev/null
+
+    apt update
+
+    echo "=== Instalando Krill ==="
+    apt install -y krill krillup krillta
+
+    echo "=== Instalando Routinator ==="
+    apt install -y routinator
+
+    systemctl enable krill
+    systemctl enable routinator
+
+    echo "=== Configurando Krill ==="
+    cp /etc/krill.conf /etc/krill.conf.orig
+
+    if grep -q "ip = " /etc/krill.conf; then
+        sed -i 's/ip = .*"/ip = "0.0.0.0"/' /etc/krill.conf
+    else
+        echo 'ip = "0.0.0.0"' >> /etc/krill.conf
+    fi
+
+    echo "=== Configurando Routinator ==="
+    if [ -f /etc/routinator/routinator.conf ]; then
+        cp /etc/routinator/routinator.conf /etc/routinator/routinator.conf.orig
+
+        sed -i 's/^rtr-listen = \["127.0.0.1:3323"\]/#rtr-listen = ["127.0.0.1:3323"]/' /etc/routinator/routinator.conf
+        sed -i 's/^http-listen = \["127.0.0.1:8323"\]/#http-listen = ["127.0.0.1:8323"]/' /etc/routinator/routinator.conf
+
+        grep -q 'rtr-listen = \[ "\[::\]:3323" \]' /etc/routinator/routinator.conf || \
+            echo 'rtr-listen = [ "[::]:3323" ]' >> /etc/routinator/routinator.conf
+
+        grep -q 'http-listen = \[ "\[::\]:8323" \]' /etc/routinator/routinator.conf || \
+            echo 'http-listen = [ "[::]:8323" ]' >> /etc/routinator/routinator.conf
+    else
+        echo "AVISO: Arquivo de configuracao do Routinator nao encontrado."
+    fi
+
+    echo "=== Executando routinator vrps (pode levar alguns minutos) ==="
+    routinator vrps
+
+    systemctl start krill
+    systemctl restart routinator
+
+    TOKEN=$(grep "token =" /etc/krill.conf | cut -d'"' -s -f2)
+
+    whiptail --title "Instalacao Concluida - RPKI" --msgbox \
+"Krill e Routinator instalados com sucesso.\n
+Krill
+  Interface web : https://[seu-ip]:3000
+  Token         : ${TOKEN}\n
+Routinator
+  HTTP API      : http://[seu-ip]:8323
+  RTR           : [seu-ip]:3323" 16 65
+
+    whiptail --title "iptables" --yesno "Deseja configurar o iptables?" 8 50
+    [[ $? -eq 0 ]] && fn_iptables "rpki"
+}
+
+fn_rota_persistente() {
+    mapfile -t interfaces < <(ip link show | awk -F': ' '/^[0-9]+: / && !/lo/ {print $2}' | awk '{print $1}')
+
+    local iface_opts=()
+    for iface_item in "${interfaces[@]}"; do
+        iface_opts+=("$iface_item" "")
+    done
+
+    iface=$(whiptail --title "Rota Persistente" \
+        --menu "Selecione a interface de rede:" 20 60 8 \
+        "${iface_opts[@]}" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    mapfile -t gateways_priv < <(ip route show dev "$iface" | awk '/via/ {print $3}' | sort -u)
+
+    if [[ ${#gateways_priv[@]} -eq 0 ]]; then
+        whiptail --title "Erro" --msgbox "Nenhum gateway detectado na interface $iface." 8 50
+        return 1
+    fi
+
+    local gw_opts=()
+    for gw_item in "${gateways_priv[@]}"; do
+        gw_opts+=("$gw_item" "")
+    done
+
+    gateway=$(whiptail --title "Rota Persistente" \
+        --menu "Selecione o gateway privado:" 20 60 8 \
+        "${gw_opts[@]}" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    mapfile -t ips_disponiveis < <(ip -4 addr show dev "$iface" | awk '/inet / {print $2}' | cut -d/ -f1)
+
+    if [[ ${#ips_disponiveis[@]} -eq 0 ]]; then
+        whiptail --title "Erro" --msgbox "Nenhum IP encontrado na interface $iface." 8 50
+        return 1
+    fi
+
+    local ip_opts=()
+    for ip_item in "${ips_disponiveis[@]}"; do
+        ip_opts+=("$ip_item" "")
+    done
+
+    src_ip=$(whiptail --title "Rota Persistente" \
+        --menu "Selecione o IP de origem publico (src):" 20 60 8 \
+        "${ip_opts[@]}" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    whiptail --title "Rota Persistente - Confirmacao" \
+        --yesno "Confirmar configuracao?\n\n  Interface : $iface\n  Gateway   : $gateway\n  IP origem : $src_ip" 12 50
+    [[ $? -ne 0 ]] && return 1
+
+    cat > /usr/local/bin/rota_persistente.sh << EOF
+#!/bin/bash
+ip route del default dev $iface
+ip route add default via $gateway dev $iface src $src_ip
+EOF
+
+    chmod +x /usr/local/bin/rota_persistente.sh
+
+    cat > /etc/systemd/system/rota-persistente.service << EOF
+[Unit]
+Description=Rota persistente com IP de origem
+After=network.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=60
+ExecStartPre=/bin/bash -c 'until ip route show | grep -q "$gateway"; do sleep 2; done'
+ExecStart=/usr/local/bin/rota_persistente.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now rota-persistente
+
+    if systemctl is-active --quiet rota-persistente; then
+        whiptail --title "Concluido" --msgbox "Rota persistente configurada e servico ativado com sucesso.\n\n  Interface : $iface\n  Gateway   : $gateway\n  IP origem : $src_ip" 12 60
+    else
+        whiptail --title "Atencao" --msgbox "Rota configurada, porem o servico nao iniciou. Verifique com:\nsystemctl status rota-persistente" 10 60
+    fi
+}
+
+fn_ookla() {
+    cd /tmp || return 1
+
+    wget -q https://install.speedtest.net/ooklaserver/ooklaserver.sh -O ooklaserver.sh
+    if [[ $? -ne 0 ]]; then
+        whiptail --title "Erro" --msgbox "Falha ao baixar o instalador do Ookla. Verifique a conectividade." 8 60
+        return 1
+    fi
+
+    chmod +x ooklaserver.sh
+    bash ooklaserver.sh install
+
+    cat > /etc/systemd/system/ookla.service <<EOF
+[Unit]
+Description=OoklaServer start after reboot
+After=network.target
+StartLimitIntervalSec=3
+
+[Service]
+User=ookla_user
+Group=ookla_user
+WorkingDirectory=/home/ookla_user/
+Type=forking
+KillMode=process
+ExecStart=/bin/bash /home/ookla_user/ooklaserver.sh start
+TimeoutStartSec=30
+TimeoutStopSec=60
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable ookla.service
+    systemctl start ookla.service
+
+    if systemctl is-active --quiet ookla.service; then
+        whiptail --title "Concluido" --msgbox "Ookla instalado e servico iniciado com sucesso.\n\nSite para testes:\nhttps://www.speedtest.net/host-tester" 10 60
+    else
+        whiptail --title "Atencao" --msgbox "Ookla instalado, porem o servico nao iniciou. Verifique com:\nsystemctl status ookla.service\n\nSite para testes apos correcao:\nhttps://www.speedtest.net/host-tester" 12 60
+    fi
+}
+
+fn_mc() {
+    cd /tmp || return 1
+
+    wget -O install-x86_64.sh https://static.minhaconexao.com.br/mc-server-scripts/3.0.7/install-x86_64.sh
+    if [[ $? -ne 0 ]]; then
+        whiptail --title "Erro" --msgbox "Falha ao baixar o instalador do MC. Verifique a conectividade." 8 60
+        return 1
+    fi
+
+    chmod +x install-x86_64.sh
+    bash install-x86_64.sh
+
+    if [[ $? -ne 0 ]]; then
+        whiptail --title "Erro" --msgbox "Falha durante a instalacao do MC. Verifique os logs." 8 60
+        return 1
+    fi
+
+    whiptail --title "Concluido" --msgbox "MC (MinhaConexao) instalado com sucesso.\n\nSite para testes (porta 9090):\nhttp://testeportas.com.br/" 10 60
+}
+
+fn_nperf() {
+    apt-get install -y lsb-release gnupg
+
+    mkdir -p /etc/apt/keyrings
+    curl https://repository.nperf.com/api/packages/public/debian/repository.key -o /etc/apt/keyrings/nperf.asc
+    if [[ $? -ne 0 ]]; then
+        whiptail --title "Erro" --msgbox "Falha ao baixar a chave do repositorio nPerf. Verifique a conectividade." 8 60
+        return 1
+    fi
+
+    echo "deb [signed-by=/etc/apt/keyrings/nperf.asc] https://repository.nperf.com/api/packages/public/debian $(lsb_release -sc) main" \
+        | tee /etc/apt/sources.list.d/nperf.list > /dev/null
+
+    apt-get update
+    apt-get install -y nperf-server
+
+    if [[ $? -ne 0 ]]; then
+        whiptail --title "Erro" --msgbox "Falha ao instalar o nperf-server. Verifique os logs do apt." 8 60
+        return 1
+    fi
+
+    if systemctl is-enabled --quiet ookla.service 2>/dev/null; then
+        whiptail --title "nPerf - Portas" --msgbox "Ookla detectado. As portas do nPerf serao ajustadas para evitar conflito." 8 60
+
+        sed -i '/^PORT=/c\PORT=8081' /etc/nperf/nperf-server.conf
+        sed -i '/^#BIND_IP=/c\BIND_IP="::"' /etc/nperf/nperf-server.conf
+        sed -i '/^REDIRECT_PORT_80=/c\REDIRECT_PORT_80=0' /etc/nperf/nperf-server.conf
+        sed -i '/^REDIRECT_PORT_443=/c\REDIRECT_PORT_443=0' /etc/nperf/nperf-server.conf
+
+        sed -i '/^PORT=/c\PORT=8081' /etc/init.d/nperf-server
+        sed -i '/^TLS_PORT=/c\TLS_PORT=8443' /etc/init.d/nperf-server
+        sed -i '/^REDIRECT_PORT_80=/c\REDIRECT_PORT_80=0' /etc/init.d/nperf-server
+        sed -i '/^REDIRECT_PORT_443=/c\REDIRECT_PORT_443=0' /etc/init.d/nperf-server
+    else
+        sed -i '/^#BIND_IP=/c\BIND_IP="::"' /etc/nperf/nperf-server.conf
+    fi
+
+    /etc/init.d/nperf-server start
+    systemctl enable nperf-server
+
+    if systemctl is-active --quiet nperf-server; then
+        whiptail --title "Concluido" --msgbox "nPerf instalado e servico iniciado com sucesso.\n\nSite para testes:\nhttps://server-check.nperf.com/" 10 60
+    else
+        whiptail --title "Atencao" --msgbox "nPerf instalado, porem o servico nao iniciou. Verifique com:\nsystemctl status nperf-server\n\nSite para testes apos correcao:\nhttps://server-check.nperf.com/" 12 60
+    fi
+}
+
+fn_speedtest() {
+    while true; do
+        choice=$(whiptail --title "Servidores de Velocidade" \
+            --menu "Selecione o servidor:" 16 60 5 \
+            "1" "Instalar Ookla" \
+            "2" "Instalar nPerf" \
+            "3" "Instalar MC (MinhaConexao)" \
+            "4" "Voltar" \
+            3>&1 1>&2 2>&3)
+
+        [[ $? -ne 0 ]] && return 0
+
+        case "$choice" in
+            1) fn_ookla ;;
+            2) fn_nperf ;;
+            3) fn_mc ;;
+            4) return 0 ;;
+        esac
+    done
+}
+
+menu() {
+    while true; do
+        choice=$(whiptail --title "Hub de Configuracoes" \
+            --menu "Selecione uma opcao:" 26 65 11 \
+            "1" "Instalar DNS Unbound Recursivo" \
+            "2" "Instalar DNS Unbound Reverso" \
+            "3" "Instalar Monitor do Unbound" \
+            "4" "Instalar Zabbix-Agent2 Padrao" \
+            "5" "Instalar Zabbix-Agent2 com Monitoramento Unbound" \
+            "6" "Instalar e configurar iptables" \
+            "7" "Instalar Krill e Routinator (RPKI)" \
+            "8" "Configurar Rota Default com Origem Publica" \
+            "9" "Instalar Servidores de velocidade (Ookla, Nperf e MC)" \
+            "10" "Sair" \
+            3>&1 1>&2 2>&3)
+
+        exitstatus=$?
+        [[ $exitstatus -ne 0 ]] && exit 0
+
+        case "$choice" in
+            1) fn_instalar_recursivo ;;
+            2) fn_reverso ;;
+            3) fn_monitor_unbound ;;
+            4) fn_zabbix_comum ;;
+            5) fn_zabbix_unbound ;;
+            6) fn_iptables ;;
+            7) fn_rpki ;;
+            8) fn_rota_persistente ;;
+            9) fn_speedtest ;;
+            10) exit 0 ;;
+        esac
+    done
+}
+
+menu
