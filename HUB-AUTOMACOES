@@ -548,6 +548,21 @@ EOF
     systemctl enable --now zabbix-agent2
     systemctl restart zabbix-agent2
     whiptail --title "Concluido" --msgbox "Zabbix Agent2 configurado.\nHostname: ${sys_hostname}" 8 60
+
+    if systemctl is-active --quiet netfilter-persistent 2>/dev/null || iptables -L INPUT -n 2>/dev/null | grep -q "DROP\|REJECT"; then
+        whiptail --title "iptables Detectado" --yesno "Firewall ativo detectado. Deseja adicionar a origem para liberacao da porta 10050 (Zabbix)?" 8 65
+        if [[ $? -eq 0 ]]; then
+            zabbix_src=$(whiptail --title "iptables - Zabbix" \
+                --inputbox "Origem para porta 10050 do Zabbix (CIDR ou IP):" 10 60 \
+                3>&1 1>&2 2>&3)
+            if [[ $? -eq 0 && -n "$zabbix_src" ]]; then
+                iptables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
+                iptables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
+                netfilter-persistent save
+                whiptail --title "Concluido" --msgbox "Regra para porta 10050 adicionada e salva." 8 50
+            fi
+        fi
+    fi
 }
 
 fn_zabbix_unbound() {
