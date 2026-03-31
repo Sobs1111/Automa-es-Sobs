@@ -72,6 +72,12 @@ detectar_tier() {
 instalar_unbound_base() {
     apt install rsyslog ssh net-tools dnsutils unbound -y
 
+    mkdir -p /etc/unbound/unbound.conf.d
+
+    cat > /etc/unbound/unbound.conf <<EOF
+include-toplevel: "/etc/unbound/unbound.conf.d/*.conf"
+EOF
+
     cat > /etc/unbound/acl.conf <<EOF
 access-control: ::/0 allow
 access-control: 0.0.0.0/0 allow
