@@ -520,8 +520,17 @@ preparar_zabbix() {
 fn_zabbix_comum() {
     preparar_zabbix
     sys_hostname=$(hostname)
-    sed -i "s/^Server=.*/Server=0.0.0.0\/0/" /etc/zabbix/zabbix_agent2.conf
-    sed -i "s/^Hostname=.*/Hostname=${sys_hostname}/" /etc/zabbix/zabbix_agent2.conf
+
+    local conf
+    conf=$(find /etc/zabbix -name "zabbix_agent2.conf" 2>/dev/null | head -1)
+
+    if [[ -z "$conf" ]]; then
+        whiptail --title "Erro" --msgbox "Arquivo zabbix_agent2.conf nao encontrado em /etc/zabbix.\nVerifique a instalacao do pacote." 10 60
+        return 1
+    fi
+
+    sed -i "s/^Server=.*/Server=0.0.0.0\/0/" "$conf"
+    sed -i "s/^Hostname=.*/Hostname=${sys_hostname}/" "$conf"
     systemctl enable --now zabbix-agent2
     systemctl restart zabbix-agent2
     whiptail --title "Concluido" --msgbox "Zabbix Agent2 configurado.\nHostname: ${sys_hostname}" 8 60
