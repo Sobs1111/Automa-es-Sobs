@@ -596,6 +596,10 @@ EOF
     chmod 0440 /etc/sudoers.d/zabbix-agent
     usermod -a -G unbound zabbix
 
+    if ! grep -q "unbound-control stats_noreset" /etc/sudoers; then
+        echo "zabbix ALL=(ALL) NOPASSWD: /usr/sbin/unbound-control stats_noreset" >> /etc/sudoers
+    fi
+
     cat > /etc/zabbix/zabbix_agent2.d/userparameter_unbound.conf <<'EOF'
 UserParameter=unbound.service,systemctl is-active unbound >/dev/null 2>&1 && echo 1 || echo 0
 UserParameter=unbound.service.status,systemctl status unbound --no-pager -l 2>/dev/null | head -3 | tail -1 | awk '{print $2}' || echo "unknown"
@@ -608,8 +612,10 @@ UserParameter=unbound.cache.hitrate,sudo /usr/sbin/unbound-control stats_noreset
 UserParameter=unbound.cache.size,sudo /usr/sbin/unbound-control stats_noreset | grep "msg.cache.count=" | cut -d= -f2
 UserParameter=unbound.rrset.cache.size,sudo /usr/sbin/unbound-control stats_noreset | grep "rrset.cache.count=" | cut -d= -f2
 UserParameter=unbound.mem.total,sudo /usr/sbin/unbound-control stats_noreset | awk '/^mem\./{sum += $2} END{print sum}' FS='='
+UserParameter=unbound.mem[*],sudo /usr/sbin/unbound-control stats_noreset | grep "mem.$1=" | cut -d= -f2
 UserParameter=unbound.mem.cache,sudo /usr/sbin/unbound-control stats_noreset | grep "mem.cache.message=" | cut -d= -f2
 UserParameter=unbound.mem.cache.rrset,sudo /usr/sbin/unbound-control stats_noreset | grep "mem.cache.rrset=" | cut -d= -f2
+UserParameter=unbound.total[*],sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.$1=" | cut -d= -f2
 UserParameter=unbound.total.queries,sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.queries=" | cut -d= -f2
 UserParameter=unbound.total.cachehits,sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.cachehits=" | cut -d= -f2
 UserParameter=unbound.total.cachemiss,sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.cachemiss=" | cut -d= -f2
@@ -625,8 +631,11 @@ UserParameter=unbound.num.query.flagAA,sudo /usr/sbin/unbound-control stats_nore
 UserParameter=unbound.num.query.flagTC,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagTC=" | cut -d= -f2
 UserParameter=unbound.num.query.flagRD,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagRD=" | cut -d= -f2
 UserParameter=unbound.num.query.flagRA,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagRA=" | cut -d= -f2
+UserParameter=unbound.num.query.flagZ,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagZ=" | cut -d= -f2
 UserParameter=unbound.num.query.flagAD,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagAD=" | cut -d= -f2
 UserParameter=unbound.num.query.flagCD,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagCD=" | cut -d= -f2
+UserParameter=unbound.flag[*],sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.$1=" | cut -d= -f2
+UserParameter=unbound.type[*],echo -n 0; sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.$1=" | cut -d= -f2
 UserParameter=unbound.type.A,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.A=" | cut -d= -f2
 UserParameter=unbound.type.AAAA,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.AAAA=" | cut -d= -f2
 UserParameter=unbound.type.MX,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.MX=" | cut -d= -f2
@@ -634,24 +643,41 @@ UserParameter=unbound.type.TXT,sudo /usr/sbin/unbound-control stats_noreset | gr
 UserParameter=unbound.type.PTR,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.PTR=" | cut -d= -f2
 UserParameter=unbound.type.CNAME,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.CNAME=" | cut -d= -f2
 UserParameter=unbound.type.NS,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.NS=" | cut -d= -f2
+UserParameter=unbound.rcode[*],sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.$1=" | cut -d= -f2
 UserParameter=unbound.rcode.NOERROR,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.NOERROR=" | cut -d= -f2
 UserParameter=unbound.rcode.NXDOMAIN,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.NXDOMAIN=" | cut -d= -f2
 UserParameter=unbound.rcode.SERVFAIL,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.SERVFAIL=" | cut -d= -f2
 UserParameter=unbound.rcode.REFUSED,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.REFUSED=" | cut -d= -f2
+UserParameter=unbound.class[*],sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.class.$1=" | cut -d= -f2
 UserParameter=unbound.class.IN,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.class.IN=" | cut -d= -f2
+UserParameter=unbound.histogram[*],sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.$1=" | cut -d= -f2
+UserParameter=unbound.histogram.custom[*],sudo /usr/sbin/unbound-control stats_noreset | awk -F= '/histogram.$1/{sub(/.ms total/, "", $1); print $2}'
+UserParameter=unbound.histogram.total[*],sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.$1=" | cut -d= -f2
+UserParameter=unbound.histogram.avg,sudo /usr/sbin/unbound-control stats_noreset | awk '/^histogram\./{split($1,a,"."); if(a[2]!="bucket") {time=a[2]; gsub("ms","",time); queries=$2; total_time+=time*queries; total_queries+=queries}} END{if(total_queries>0) printf "%.2f", total_time/total_queries; else print 0}' FS='='
+UserParameter=unbound.num.query.https,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.HTTPS=" | cut -d= -f2
+UserParameter=unbound.num.query.dnskey,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.DNSKEY=" | cut -d= -f2
+UserParameter=unbound.num.query.ds,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.DS=" | cut -d= -f2
 UserParameter=unbound.num.answer.secure,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.secure=" | cut -d= -f2
 UserParameter=unbound.num.answer.bogus,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.bogus=" | cut -d= -f2
+UserParameter=unbound.thread[*],sudo /usr/sbin/unbound-control stats_noreset | grep "thread$1.num.queries=" | cut -d= -f2
 UserParameter=unbound.unwanted.queries,sudo /usr/sbin/unbound-control stats_noreset | grep "unwanted.queries=" | cut -d= -f2
 UserParameter=unbound.unwanted.replies,sudo /usr/sbin/unbound-control stats_noreset | grep "unwanted.replies=" | cut -d= -f2
 UserParameter=unbound.process.cpu,ps -C unbound -o pid,pcpu | grep -v PID | awk '{sum += $2} END{print sum}'
 UserParameter=unbound.process.memory,ps -C unbound -o pid,rss | grep -v PID | awk '{sum += $2} END{print sum*1024}'
 UserParameter=unbound.process.count,pgrep -c unbound
+UserParameter=unbound.discovery.types,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type" | sed 's/num.query.type.//g' | cut -d= -f1 | awk '{print "{\"" $0 "\"}"}'
+UserParameter=unbound.discovery.rcodes,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode" | sed 's/num.answer.rcode.//g' | cut -d= -f1 | awk '{print "{\"" $0 "\"}"}'
 UserParameter=unbound.test.query,timeout 5 dig @127.0.0.1 google.com >/dev/null 2>&1 && echo 1 || echo 0
 UserParameter=unbound.test.response.time,timeout 5 dig @127.0.0.1 google.com | grep "Query time:" | awk '{print $4}' 2>/dev/null || echo 0
 UserParameter=unbound.efficiency,sudo /usr/sbin/unbound-control stats_noreset | awk "/total.num.cachehits=/{h=\$2} /total.num.queries=/{q=\$2} END{if(q>0) printf \"%.2f\", (h/q)*100; else print 0}" FS="="
 UserParameter=unbound.dns.status,systemctl is-active unbound >/dev/null 2>&1 && echo 1 || echo 0
-UserParameter=unbound.query.ipv6,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.ipv6=" | cut -d= -f2
 UserParameter=unbound.stats[*],sudo /usr/sbin/unbound-control stats_noreset | grep "^$1=" | cut -d= -f2
+UserParameter=unbound.qps.total,sudo /usr/sbin/unbound-control stats | grep "total.num.queries=" | cut -d= -f2 | awk '{print $1/60}' # Divide pelo intervalo
+UserParameter=unbound.qps.cachehits,sudo /usr/sbin/unbound-control stats | grep "total.num.cachehits=" | cut -d= -f2 | awk '{print $1/60}'
+UserParameter=unbound.qps.type[*],sudo /usr/sbin/unbound-control stats | grep "num.query.type.$1=" | cut -d= -f2 | awk '{print $1/60}'
+UserParameter=unbound.histogram.0.016to0.032,sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.0000000.016000.032000.to.0000000.032000.064000=" | cut -d= -f2
+UserParameter=unbound.histogram.2.048to4.096,sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.0000002.048000.000000.to.0000004.096000.000000=" | cut -d= -f2
+UserParameter=unbound.query.ipv6,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.ipv6=" | cut -d= -f2
 EOF
 
     chmod 644 /etc/zabbix/zabbix_agent2.d/userparameter_unbound.conf
