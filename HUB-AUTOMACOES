@@ -1105,8 +1105,10 @@ fn_adicionar_usuario() {
 fn_requisitos() {
     cpu_modelo=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | sed 's/^ //' | cut -c1-35)
     cpu_nucleos=$(nproc)
-    cpu_uso=$(top -bn1 | grep -E "^(%Cpu|Cpu)" | awk '{print $2}' | tr -d '%us,' | cut -d. -f1)
-    [[ -z "$cpu_uso" ]] && cpu_uso=$(top -bn1 | grep -E "^(%Cpu|Cpu)" | awk -F',' '{print $1}' | awk '{print $NF}' | tr -d '% ')
+    read cpu_idle1 cpu_total1 < <(awk '/^cpu / {idle=$5; total=0; for(i=2;i<=NF;i++) total+=$i; print idle, total}' /proc/stat)
+    sleep 1
+    read cpu_idle2 cpu_total2 < <(awk '/^cpu / {idle=$5; total=0; for(i=2;i<=NF;i++) total+=$i; print idle, total}' /proc/stat)
+    cpu_uso=$(awk "BEGIN {d_idle=$cpu_idle2-$cpu_idle1; d_total=$cpu_total2-$cpu_total1; if(d_total>0) printf \"%.0f\", (1-(d_idle/d_total))*100; else print 0}")
 
     ram_total=$(awk '/MemTotal/ {printf "%.1f", $2/1024/1024}' /proc/meminfo)
     ram_livre=$(awk '/MemAvailable/ {printf "%.1f", $2/1024/1024}' /proc/meminfo)
