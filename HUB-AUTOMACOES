@@ -1103,9 +1103,10 @@ fn_adicionar_usuario() {
 }
 
 fn_requisitos() {
-    cpu_modelo=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')
+    cpu_modelo=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | sed 's/^ //' | cut -c1-35)
     cpu_nucleos=$(nproc)
-    cpu_uso=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d. -f1)
+    cpu_uso=$(top -bn1 | grep -E "^(%Cpu|Cpu)" | awk '{print $2}' | tr -d '%us,' | cut -d. -f1)
+    [[ -z "$cpu_uso" ]] && cpu_uso=$(top -bn1 | grep -E "^(%Cpu|Cpu)" | awk -F',' '{print $1}' | awk '{print $NF}' | tr -d '% ')
 
     ram_total=$(awk '/MemTotal/ {printf "%.1f", $2/1024/1024}' /proc/meminfo)
     ram_livre=$(awk '/MemAvailable/ {printf "%.1f", $2/1024/1024}' /proc/meminfo)
@@ -1130,7 +1131,7 @@ MEMORIA RAM
 ARMAZENAMENTO (/)
   Total   : $disco_total
   Em uso  : $disco_usado ($disco_pct)
-  Livre   : $disco_livre" 22 60
+  Livre   : $disco_livre" 22 55
 }
 
 fn_tcpdump() {
