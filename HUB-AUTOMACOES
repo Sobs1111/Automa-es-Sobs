@@ -482,17 +482,51 @@ fn_iptables() {
         iptables -A INPUT -p tcp -s "$src" --dport 22 -j ACCEPT
     done
 
-    case "$contexto" in
-        dns)
-            iptables -A INPUT -p tcp --dport 53 -j ACCEPT
-            iptables -A INPUT -p udp --dport 53 -j ACCEPT
-            ;;
-        rpki)
-            iptables -A INPUT -p tcp --dport 3000 -j ACCEPT
-            iptables -A INPUT -p tcp --dport 8323 -j ACCEPT
-            iptables -A INPUT -p tcp --dport 3323 -j ACCEPT
-            ;;
-    esac
+    if systemctl cat unbound &>/dev/null; then
+        whiptail --title "iptables - DNS (porta 53)" \
+            --yesno "Unbound detectado. Deseja liberar a porta 53?" 8 55
+        if [[ $? -eq 0 ]]; then
+            whiptail --title "iptables - DNS (porta 53)" \
+                --yesno "Liberar porta 53 para qualquer origem?" 8 55
+            if [[ $? -eq 0 ]]; then
+                iptables -A INPUT -p tcp --dport 53 -j ACCEPT
+                iptables -A INPUT -p udp --dport 53 -j ACCEPT
+            else
+                while true; do
+                    dns_src=$(whiptail --title "iptables - DNS" \
+                        --inputbox "Origem permitida para porta 53 (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
+                        3>&1 1>&2 2>&3)
+                    [[ $? -ne 0 || -z "$dns_src" ]] && break
+                    iptables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
+                    iptables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
+                done
+            fi
+        fi
+    fi
+
+    if systemctl cat krill &>/dev/null || systemctl cat routinator &>/dev/null; then
+        whiptail --title "iptables - RPKI (3000/8323/3323)" \
+            --yesno "RPKI detectado. Deseja liberar as portas 3000, 8323 e 3323?" 8 60
+        if [[ $? -eq 0 ]]; then
+            whiptail --title "iptables - RPKI" \
+                --yesno "Liberar portas RPKI para qualquer origem?" 8 55
+            if [[ $? -eq 0 ]]; then
+                iptables -A INPUT -p tcp --dport 3000 -j ACCEPT
+                iptables -A INPUT -p tcp --dport 8323 -j ACCEPT
+                iptables -A INPUT -p tcp --dport 3323 -j ACCEPT
+            else
+                while true; do
+                    rpki_src=$(whiptail --title "iptables - RPKI" \
+                        --inputbox "Origem permitida para portas RPKI (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
+                        3>&1 1>&2 2>&3)
+                    [[ $? -ne 0 || -z "$rpki_src" ]] && break
+                    iptables -A INPUT -p tcp -s "$rpki_src" --dport 3000 -j ACCEPT
+                    iptables -A INPUT -p tcp -s "$rpki_src" --dport 8323 -j ACCEPT
+                    iptables -A INPUT -p tcp -s "$rpki_src" --dport 3323 -j ACCEPT
+                done
+            fi
+        fi
+    fi
 
     if systemctl is-active --quiet zabbix-agent2 2>/dev/null; then
         zabbix_src=$(whiptail --title "iptables - Zabbix" \
@@ -503,6 +537,29 @@ fn_iptables() {
             iptables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
         fi
     fi
+
+    while true; do
+        porta_custom=$(whiptail --title "iptables - Porta Customizada" \
+            --inputbox "Porta adicional para liberar (deixe vazio para finalizar):" 8 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$porta_custom" ]] && break
+
+        whiptail --title "iptables - Porta $porta_custom" \
+            --yesno "Liberar porta $porta_custom para qualquer origem?" 8 55
+        if [[ $? -eq 0 ]]; then
+            iptables -A INPUT -p tcp --dport "$porta_custom" -j ACCEPT
+            iptables -A INPUT -p udp --dport "$porta_custom" -j ACCEPT
+        else
+            while true; do
+                custom_src=$(whiptail --title "iptables - Porta $porta_custom" \
+                    --inputbox "Origem para porta $porta_custom (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
+                    3>&1 1>&2 2>&3)
+                [[ $? -ne 0 || -z "$custom_src" ]] && break
+                iptables -A INPUT -p tcp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
+                iptables -A INPUT -p udp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
+            done
+        fi
+    done
 
     netfilter-persistent save
     whiptail --title "Concluido" --msgbox "Regras de iptables aplicadas e salvas." 8 50
@@ -672,7 +729,7 @@ UserParameter=unbound.test.response.time,timeout 5 dig @127.0.0.1 google.com | g
 UserParameter=unbound.efficiency,sudo /usr/sbin/unbound-control stats_noreset | awk "/total.num.cachehits=/{h=\$2} /total.num.queries=/{q=\$2} END{if(q>0) printf \"%.2f\", (h/q)*100; else print 0}" FS="="
 UserParameter=unbound.dns.status,systemctl is-active unbound >/dev/null 2>&1 && echo 1 || echo 0
 UserParameter=unbound.stats[*],sudo /usr/sbin/unbound-control stats_noreset | grep "^$1=" | cut -d= -f2
-UserParameter=unbound.qps.total,sudo /usr/sbin/unbound-control stats | grep "total.num.queries=" | cut -d= -f2 | awk '{print $1/60}' # Divide pelo intervalo
+UserParameter=unbound.qps.total,sudo /usr/sbin/unbound-control stats | grep "total.num.queries=" | cut -d= -f2 | awk '{print $1/60}'
 UserParameter=unbound.qps.cachehits,sudo /usr/sbin/unbound-control stats | grep "total.num.cachehits=" | cut -d= -f2 | awk '{print $1/60}'
 UserParameter=unbound.qps.type[*],sudo /usr/sbin/unbound-control stats | grep "num.query.type.$1=" | cut -d= -f2 | awk '{print $1/60}'
 UserParameter=unbound.histogram.0.016to0.032,sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.0000000.016000.032000.to.0000000.032000.064000=" | cut -d= -f2
