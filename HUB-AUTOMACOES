@@ -548,6 +548,8 @@ EOF
 
     unbound-control-setup
 
+    apt install sudo -y
+
     cat > /etc/sudoers.d/zabbix-agent <<EOF
 Defaults:zabbix !requiretty
 zabbix ALL = NOPASSWD: /usr/sbin/unbound-control
