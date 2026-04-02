@@ -39,7 +39,7 @@ detectar_tier() {
     else tier_cpu="alto"; fi
 
     if (( ram_gb < 6 )); then tier_ram="baixo"
-    elif (( ram_gb <= 16 )); then tier_ram="medio"
+    elif (( ram_gb <= 12 )); then tier_ram="medio"
     else tier_ram="alto"; fi
 
     tier_order() { case $1 in baixo) echo 1;; medio) echo 2;; alto) echo 3;; esac; }
