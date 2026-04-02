@@ -468,18 +468,23 @@ fn_iptables() {
         ssh_origins+=("$ssh_src")
     done
 
-    iptables -F
-    iptables -P INPUT DROP
-    iptables -P FORWARD DROP
-    iptables -P OUTPUT ACCEPT
-
-    iptables -A INPUT -i lo -j ACCEPT
-    iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
-    iptables -A INPUT -p icmp -j ACCEPT
-    iptables -A OUTPUT -p icmp -j ACCEPT
+    for ipt in iptables ip6tables; do
+        $ipt -F
+        $ipt -P INPUT DROP
+        $ipt -P FORWARD DROP
+        $ipt -P OUTPUT ACCEPT
+        $ipt -A INPUT -i lo -j ACCEPT
+        $ipt -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+        $ipt -A INPUT -p icmp -j ACCEPT
+        $ipt -A OUTPUT -p icmp -j ACCEPT
+    done
 
     for src in "${ssh_origins[@]}"; do
-        iptables -A INPUT -p tcp -s "$src" --dport 22 -j ACCEPT
+        if [[ "$src" == *:* ]]; then
+            ip6tables -A INPUT -p tcp -s "$src" --dport 22 -j ACCEPT
+        else
+            iptables -A INPUT -p tcp -s "$src" --dport 22 -j ACCEPT
+        fi
     done
 
     if systemctl cat unbound &>/dev/null; then
@@ -489,16 +494,23 @@ fn_iptables() {
             whiptail --title "iptables - DNS (porta 53)" \
                 --yesno "Liberar porta 53 para qualquer origem?" 8 55
             if [[ $? -eq 0 ]]; then
-                iptables -A INPUT -p tcp --dport 53 -j ACCEPT
-                iptables -A INPUT -p udp --dport 53 -j ACCEPT
+                for ipt in iptables ip6tables; do
+                    $ipt -A INPUT -p tcp --dport 53 -j ACCEPT
+                    $ipt -A INPUT -p udp --dport 53 -j ACCEPT
+                done
             else
                 while true; do
                     dns_src=$(whiptail --title "iptables - DNS" \
                         --inputbox "Origem permitida para porta 53 (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
                         3>&1 1>&2 2>&3)
                     [[ $? -ne 0 || -z "$dns_src" ]] && break
-                    iptables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
-                    iptables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
+                    if [[ "$dns_src" == *:* ]]; then
+                        ip6tables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
+                        ip6tables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
+                    else
+                        iptables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
+                        iptables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
+                    fi
                 done
             fi
         fi
@@ -511,18 +523,26 @@ fn_iptables() {
             whiptail --title "iptables - RPKI" \
                 --yesno "Liberar portas RPKI para qualquer origem?" 8 55
             if [[ $? -eq 0 ]]; then
-                iptables -A INPUT -p tcp --dport 3000 -j ACCEPT
-                iptables -A INPUT -p tcp --dport 8323 -j ACCEPT
-                iptables -A INPUT -p tcp --dport 3323 -j ACCEPT
+                for ipt in iptables ip6tables; do
+                    $ipt -A INPUT -p tcp --dport 3000 -j ACCEPT
+                    $ipt -A INPUT -p tcp --dport 8323 -j ACCEPT
+                    $ipt -A INPUT -p tcp --dport 3323 -j ACCEPT
+                done
             else
                 while true; do
                     rpki_src=$(whiptail --title "iptables - RPKI" \
                         --inputbox "Origem permitida para portas RPKI (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
                         3>&1 1>&2 2>&3)
                     [[ $? -ne 0 || -z "$rpki_src" ]] && break
-                    iptables -A INPUT -p tcp -s "$rpki_src" --dport 3000 -j ACCEPT
-                    iptables -A INPUT -p tcp -s "$rpki_src" --dport 8323 -j ACCEPT
-                    iptables -A INPUT -p tcp -s "$rpki_src" --dport 3323 -j ACCEPT
+                    if [[ "$rpki_src" == *:* ]]; then
+                        ip6tables -A INPUT -p tcp -s "$rpki_src" --dport 3000 -j ACCEPT
+                        ip6tables -A INPUT -p tcp -s "$rpki_src" --dport 8323 -j ACCEPT
+                        ip6tables -A INPUT -p tcp -s "$rpki_src" --dport 3323 -j ACCEPT
+                    else
+                        iptables -A INPUT -p tcp -s "$rpki_src" --dport 3000 -j ACCEPT
+                        iptables -A INPUT -p tcp -s "$rpki_src" --dport 8323 -j ACCEPT
+                        iptables -A INPUT -p tcp -s "$rpki_src" --dport 3323 -j ACCEPT
+                    fi
                 done
             fi
         fi
@@ -533,8 +553,13 @@ fn_iptables() {
             --inputbox "Origem para porta 10050 do Zabbix (CIDR ou IP):" 10 60 \
             3>&1 1>&2 2>&3)
         if [[ $? -eq 0 && -n "$zabbix_src" ]]; then
-            iptables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
-            iptables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
+            if [[ "$zabbix_src" == *:* ]]; then
+                ip6tables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
+                ip6tables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
+            else
+                iptables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
+                iptables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
+            fi
         fi
     fi
 
@@ -547,22 +572,29 @@ fn_iptables() {
         whiptail --title "iptables - Porta $porta_custom" \
             --yesno "Liberar porta $porta_custom para qualquer origem?" 8 55
         if [[ $? -eq 0 ]]; then
-            iptables -A INPUT -p tcp --dport "$porta_custom" -j ACCEPT
-            iptables -A INPUT -p udp --dport "$porta_custom" -j ACCEPT
+            for ipt in iptables ip6tables; do
+                $ipt -A INPUT -p tcp --dport "$porta_custom" -j ACCEPT
+                $ipt -A INPUT -p udp --dport "$porta_custom" -j ACCEPT
+            done
         else
             while true; do
                 custom_src=$(whiptail --title "iptables - Porta $porta_custom" \
                     --inputbox "Origem para porta $porta_custom (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
                     3>&1 1>&2 2>&3)
                 [[ $? -ne 0 || -z "$custom_src" ]] && break
-                iptables -A INPUT -p tcp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
-                iptables -A INPUT -p udp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
+                if [[ "$custom_src" == *:* ]]; then
+                    ip6tables -A INPUT -p tcp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
+                    ip6tables -A INPUT -p udp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
+                else
+                    iptables -A INPUT -p tcp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
+                    iptables -A INPUT -p udp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
+                fi
             done
         fi
     done
 
     netfilter-persistent save
-    whiptail --title "Concluido" --msgbox "Regras de iptables aplicadas e salvas." 8 50
+    whiptail --title "Concluido" --msgbox "Regras de iptables (IPv4 e IPv6) aplicadas e salvas." 8 55
 }
 
 preparar_zabbix() {
