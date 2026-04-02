@@ -475,9 +475,12 @@ fn_iptables() {
         $ipt -P OUTPUT ACCEPT
         $ipt -A INPUT -i lo -j ACCEPT
         $ipt -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
-        $ipt -A INPUT -p icmp -j ACCEPT
-        $ipt -A OUTPUT -p icmp -j ACCEPT
     done
+
+    iptables -A INPUT -p icmp -j ACCEPT
+    iptables -A OUTPUT -p icmp -j ACCEPT
+    ip6tables -I INPUT 1 -p ipv6-icmp -j ACCEPT
+    ip6tables -A OUTPUT -p ipv6-icmp -j ACCEPT
 
     for src in "${ssh_origins[@]}"; do
         if [[ "$src" == *:* ]]; then
