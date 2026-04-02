@@ -1379,10 +1379,74 @@ fn_snmpwalk() {
     whiptail --title "SNMPwalk" --msgbox "Consulta finalizada. Pressione Ok para voltar ao menu." 8 55
 }
 
+fn_proxmox_zabbix() {
+    which pveum &>/dev/null || {
+        whiptail --title "Erro" --msgbox "Este script deve ser executado em um servidor Proxmox." 8 55
+        return 1
+    }
+
+    realm=$(whiptail --title "Proxmox - Realm" \
+        --menu "Selecione o realm para criacao do usuario:" 12 60 2 \
+        "pve" "Recomendado - permissoes via VE" \
+        "pam" "Alternativo - somente se VE nao estiver disponivel" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    senha=$(tr -dc 'A-Za-z0-9!@#$%&*' < /dev/urandom | head -c 16)
+
+    pveum useradd zabbix@${realm} -comment "Zabbix monitoring user" 2>/dev/null
+    echo "${senha}" | pveum passwd zabbix@${realm} --password-stdin 2>/dev/null
+
+    if [[ $? -ne 0 ]]; then
+        pveum passwd zabbix@${realm} <<EOF
+${senha}
+${senha}
+EOF
+    fi
+
+    pveum aclmod / --user zabbix@${realm} --role PVEAuditor
+
+    whiptail --title "Concluido - Credenciais Zabbix" --msgbox \
+"Usuario criado com sucesso.\n
+  Usuario : zabbix@${realm}
+  Senha   : ${senha}
+  Role    : PVEAuditor (somente leitura)\n
+IMPORTANTE: Anote a senha agora.
+Ela nao sera exibida novamente." 16 55
+
+    preparar_zabbix
+    sys_hostname=$(hostname)
+    local conf="/etc/zabbix/zabbix_agent2.conf"
+
+    if [[ ! -f "$conf" ]]; then
+        mkdir -p /etc/zabbix/zabbix_agent2.d
+        cat > "$conf" <<EOF
+PidFile=/var/run/zabbix/zabbix_agent2.pid
+LogFile=/var/log/zabbix/zabbix_agent2.log
+LogFileSize=0
+Server=0.0.0.0/0
+ServerActive=127.0.0.1
+Hostname=${sys_hostname}
+Include=/etc/zabbix/zabbix_agent2.d/*.conf
+EOF
+    else
+        sed -i "s/^Server=.*/Server=0.0.0.0\/0/" "$conf"
+        sed -i "s/^Hostname=.*/Hostname=${sys_hostname}/" "$conf"
+    fi
+
+    systemctl enable --now zabbix-agent2
+    systemctl restart zabbix-agent2
+
+    whiptail --title "Concluido - Zabbix Agent2" --msgbox \
+"Zabbix Agent2 instalado e configurado.\n
+  Hostname : ${sys_hostname}
+  Server   : 0.0.0.0/0" 12 55
+}
+
 menu() {
     while true; do
         choice=$(whiptail --title "Hub de Configuracoes" \
-            --menu "Selecione uma opcao:" 34 65 16 \
+            --menu "Selecione uma opcao:" 36 65 17 \
             "1"  "Instalar DNS Unbound Recursivo" \
             "2"  "Instalar DNS Unbound Reverso" \
             "3"  "Instalar Monitor do Unbound" \
@@ -1396,9 +1460,10 @@ menu() {
             "11" "Verificar Requisitos da Maquina" \
             "12" "Captura de Pacotes (tcpdump)" \
             "13" "SNMPwalk" \
-            "14" "Status dos Servicos" \
-            "15" "Reiniciar Servico" \
-            "16" "Sair" \
+            "14" "Proxmox - Usuario e Zabbix-Agent2" \
+            "15" "Status dos Servicos" \
+            "16" "Reiniciar Servico" \
+            "17" "Sair" \
             3>&1 1>&2 2>&3)
 
         exitstatus=$?
@@ -1418,9 +1483,10 @@ menu() {
             11) fn_requisitos ;;
             12) fn_tcpdump ;;
             13) fn_snmpwalk ;;
-            14) fn_status_servicos ;;
-            15) fn_reiniciar_servico ;;
-            16) exit 0 ;;
+            14) fn_proxmox_zabbix ;;
+            15) fn_status_servicos ;;
+            16) fn_reiniciar_servico ;;
+            17) exit 0 ;;
         esac
     done
 }
