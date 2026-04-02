@@ -1475,10 +1475,175 @@ EOF
   Server   : 0.0.0.0/0" 12 55
 }
 
+fn_teste_dns() {
+    which dig &>/dev/null || apt-get install -y dnsutils
+
+    local dns_server="localhost"
+
+    local tipo
+    tipo=$(whiptail --title "Teste DNS Unbound" \
+        --menu "Selecione o tipo de teste:" 12 60 3 \
+        "1" "Todas as categorias" \
+        "2" "Teste rapido (Bancos, Redes Sociais, Streaming)" \
+        "3" "Personalizado" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    local selected_categories=()
+
+    if [[ "$tipo" == "3" ]]; then
+        cats=$(whiptail --title "Teste DNS - Categorias" \
+            --checklist "Selecione as categorias:" 20 60 9 \
+            "bancos"         "Bancos Brasileiros"      OFF \
+            "social"         "Redes Sociais"           OFF \
+            "streaming"      "Streaming e Entretenimento" OFF \
+            "ecommerce"      "E-Commerce"              OFF \
+            "productivity"   "Busca e Produtividade"   OFF \
+            "gaming"         "Jogos"                   OFF \
+            "governo"        "Governo e Servicos BR"   OFF \
+            "news"           "Noticias e Midia"        OFF \
+            "infrastructure" "CDN e Infraestrutura"    OFF \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && return 1
+        read -ra selected_categories <<< "$cats"
+        selected_categories=("${selected_categories[@]//\"/}")
+    elif [[ "$tipo" == "2" ]]; then
+        selected_categories=("bancos" "social" "streaming")
+    else
+        selected_categories=("bancos" "social" "streaming" "ecommerce" "productivity" "gaming" "governo" "news" "infrastructure")
+    fi
+
+    whiptail --title "Teste DNS" \
+        --yesno "Limpar cache DNS antes do teste?" 8 50
+    local limpar_cache=$?
+
+    local bancos_domains=("itau.com.br" "www.itau.com.br" "caixa.gov.br" "www.caixa.gov.br" "bradesco.com.br" "www.bradesco.com.br" "santander.com.br" "bb.com.br" "www.bb.com.br" "bancointer.com.br" "nubank.com.br" "picpay.com")
+    local social_domains=("facebook.com" "www.facebook.com" "instagram.com" "www.instagram.com" "whatsapp.com" "web.whatsapp.com" "twitter.com" "x.com" "tiktok.com" "linkedin.com" "reddit.com" "discord.com" "telegram.org")
+    local streaming_domains=("netflix.com" "www.netflix.com" "youtube.com" "www.youtube.com" "primevideo.com" "disneyplus.com" "spotify.com" "globoplay.globo.com" "twitch.tv" "globo.com")
+    local ecommerce_domains=("amazon.com.br" "www.amazon.com.br" "mercadolivre.com.br" "americanas.com.br" "magazineluiza.com.br" "shopee.com.br" "aliexpress.com" "olx.com.br" "ifood.com.br" "rappi.com.br")
+    local productivity_domains=("google.com" "www.google.com" "google.com.br" "gmail.com" "drive.google.com" "microsoft.com" "outlook.com" "office.com" "zoom.us" "slack.com")
+    local gaming_domains=("store.steampowered.com" "epicgames.com" "blizzard.com" "ea.com" "riotgames.com" "minecraft.net" "roblox.com" "xbox.com" "playstation.com" "nintendo.com")
+    local governo_domains=("gov.br" "www.gov.br" "receita.fazenda.gov.br" "inss.gov.br" "tse.jus.br" "serasa.com.br" "spc.org.br" "fgts.caixa.gov.br")
+    local news_domains=("uol.com.br" "folha.uol.com.br" "estadao.com.br" "oglobo.globo.com" "terra.com.br" "r7.com" "cnn.com" "bbc.com")
+    local infrastructure_domains=("cloudflare.com" "amazonaws.com" "github.com" "www.github.com" "stackoverflow.com" "wikipedia.org" "pt.wikipedia.org" "archive.org")
+
+    local total_ipv4_ok=0 total_ipv4_fail=0
+    local total_ipv6_ok=0 total_ipv6_fail=0
+    local total_domains_tested=0
+    local result_summary=""
+
+    test_category_domains() {
+        local cat_name="$1"; shift
+        local domains=("$@")
+        local ipv4_ok=0 ipv4_fail=0 ipv6_ok=0 ipv6_fail=0
+
+        echo ""
+        echo "=== TESTANDO: $cat_name ==="
+
+        for domain in "${domains[@]}"; do
+            echo ""
+            echo "Testando: $domain"
+
+            if [[ $limpar_cache -eq 0 ]]; then
+                unbound-control flush_zone "$domain" 2>/dev/null
+            fi
+
+            local out4
+            out4=$(dig @"$dns_server" A "$domain" +noall +answer +time=3 +tries=1 2>/dev/null)
+            if [[ -z "$out4" ]]; then
+                echo "  IPv4: FALHA"
+                ((ipv4_fail++))
+            else
+                echo "  IPv4: OK ($(echo "$out4" | wc -l) registro(s))"
+                echo "$out4" | head -2
+                ((ipv4_ok++))
+            fi
+
+            local out6
+            out6=$(dig @"$dns_server" AAAA "$domain" +noall +answer +time=3 +tries=1 2>/dev/null)
+            if [[ -z "$out6" ]]; then
+                echo "  IPv6: FALHA"
+                ((ipv6_fail++))
+            else
+                echo "  IPv6: OK ($(echo "$out6" | wc -l) registro(s))"
+                echo "$out6" | head -2
+                ((ipv6_ok++))
+            fi
+
+            ((total_domains_tested++))
+            sleep 0.3
+        done
+
+        local total_cat=$(( ipv4_ok + ipv4_fail ))
+        local ipv4_rate=$(( total_cat > 0 ? ipv4_ok * 100 / total_cat : 0 ))
+        local ipv6_rate=$(( total_cat > 0 ? ipv6_ok * 100 / total_cat : 0 ))
+
+        echo ""
+        echo "Resultado $cat_name: IPv4 ${ipv4_ok}OK/${ipv4_fail}FAIL (${ipv4_rate}%) | IPv6 ${ipv6_ok}OK/${ipv6_fail}FAIL (${ipv6_rate}%)"
+
+        ((total_ipv4_ok += ipv4_ok))
+        ((total_ipv4_fail += ipv4_fail))
+        ((total_ipv6_ok += ipv6_ok))
+        ((total_ipv6_fail += ipv6_fail))
+
+        result_summary+="$(printf '%-20s IPv4: %d%% | IPv6: %d%%\n' "$cat_name" "$ipv4_rate" "$ipv6_rate")"$'\n'
+    }
+
+    whiptail --title "Teste DNS" --msgbox "Iniciando testes. O resultado sera exibido no terminal.\nPressione Ok para comecar." 8 60
+
+    local start_time
+    start_time=$(date +%s)
+
+    for category in "${selected_categories[@]}"; do
+        case "$category" in
+            bancos)         test_category_domains "BANCOS"         "${bancos_domains[@]}" ;;
+            social)         test_category_domains "REDES SOCIAIS"  "${social_domains[@]}" ;;
+            streaming)      test_category_domains "STREAMING"      "${streaming_domains[@]}" ;;
+            ecommerce)      test_category_domains "E-COMMERCE"     "${ecommerce_domains[@]}" ;;
+            productivity)   test_category_domains "PRODUTIVIDADE"  "${productivity_domains[@]}" ;;
+            gaming)         test_category_domains "JOGOS"          "${gaming_domains[@]}" ;;
+            governo)        test_category_domains "GOVERNO BR"     "${governo_domains[@]}" ;;
+            news)           test_category_domains "NOTICIAS"       "${news_domains[@]}" ;;
+            infrastructure) test_category_domains "INFRAESTRUTURA" "${infrastructure_domains[@]}" ;;
+        esac
+    done
+
+    local end_time
+    end_time=$(date +%s)
+    local elapsed=$(( end_time - start_time ))
+
+    local ipv4_rate_global=$(( total_domains_tested > 0 ? total_ipv4_ok * 100 / total_domains_tested : 0 ))
+    local ipv6_rate_global=$(( total_domains_tested > 0 ? total_ipv6_ok * 100 / total_domains_tested : 0 ))
+
+    local analise_v4 analise_v6
+    if (( ipv4_rate_global > 90 )); then analise_v4="Excelente conectividade"
+    elif (( ipv4_rate_global > 80 )); then analise_v4="Boa conectividade"
+    elif (( ipv4_rate_global > 60 )); then analise_v4="Conectividade regular"
+    else analise_v4="Problemas de conectividade"; fi
+
+    if (( ipv6_rate_global > 70 )); then analise_v6="Excelente suporte IPv6"
+    elif (( ipv6_rate_global > 50 )); then analise_v6="Bom suporte IPv6"
+    elif (( ipv6_rate_global > 30 )); then analise_v6="Suporte IPv6 limitado"
+    else analise_v6="Pouco suporte IPv6"; fi
+
+    whiptail --title "Relatorio Final - Teste DNS" --msgbox \
+"RESUMO POR CATEGORIA:
+${result_summary}
+TOTAIS:
+  Dominios testados : $total_domains_tested
+  IPv4 OK/FAIL      : ${total_ipv4_ok}/${total_ipv4_fail} (${ipv4_rate_global}%)
+  IPv6 OK/FAIL      : ${total_ipv6_ok}/${total_ipv6_fail} (${ipv6_rate_global}%)
+  Tempo de execucao : ${elapsed}s
+
+ANALISE:
+  IPv4 : $analise_v4
+  IPv6 : $analise_v6" 28 65
+}
+
 menu() {
     while true; do
         choice=$(whiptail --title "Hub de Configuracoes" \
-            --menu "Selecione uma opcao:" 36 65 17 \
+            --menu "Selecione uma opcao:" 38 65 18 \
             "1"  "Instalar DNS Unbound Recursivo" \
             "2"  "Instalar DNS Unbound Reverso" \
             "3"  "Instalar Monitor do Unbound" \
@@ -1493,9 +1658,10 @@ menu() {
             "12" "Captura de Pacotes (tcpdump)" \
             "13" "SNMPwalk" \
             "14" "Proxmox - Usuario e Zabbix-Agent2" \
-            "15" "Status dos Servicos" \
-            "16" "Reiniciar Servico" \
-            "17" "Sair" \
+            "15" "Teste DNS Unbound (IPv4 e IPv6)" \
+            "16" "Status dos Servicos" \
+            "17" "Reiniciar Servico" \
+            "18" "Sair" \
             3>&1 1>&2 2>&3)
 
         exitstatus=$?
@@ -1516,9 +1682,10 @@ menu() {
             12) fn_tcpdump ;;
             13) fn_snmpwalk ;;
             14) fn_proxmox_zabbix ;;
-            15) fn_status_servicos ;;
-            16) fn_reiniciar_servico ;;
-            17) exit 0 ;;
+            15) fn_teste_dns ;;
+            16) fn_status_servicos ;;
+            17) fn_reiniciar_servico ;;
+            18) exit 0 ;;
         esac
     done
 }
