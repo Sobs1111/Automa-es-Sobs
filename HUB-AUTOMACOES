@@ -39,7 +39,7 @@ detectar_tier() {
     else tier_cpu="alto"; fi
 
     if (( ram_gb < 6 )); then tier_ram="baixo"
-    elif (( ram_gb <= 12 )); then tier_ram="medio"
+    elif (( ram_gb <= 16 )); then tier_ram="medio"
     else tier_ram="alto"; fi
 
     tier_order() { case $1 in baixo) echo 1;; medio) echo 2;; alto) echo 3;; esac; }
@@ -865,7 +865,7 @@ fn_rota_persistente() {
         3>&1 1>&2 2>&3)
     [[ $? -ne 0 ]] && return 1
 
-    mapfile -t ips_disponiveis < <(ip -4 addr show dev "$iface" | awk '/inet / {print $2}' | cut -d/ -f1)
+    mapfile -t ips_disponiveis < <(ip -4 addr show | awk '/inet / {print $2}' | cut -d/ -f1 | grep -v '^127\.')
 
     if [[ ${#ips_disponiveis[@]} -eq 0 ]]; then
         whiptail --title "Erro" --msgbox "Nenhum IP encontrado na interface $iface." 8 50
@@ -1460,7 +1460,7 @@ menu() {
             "11" "Verificar Requisitos da Maquina" \
             "12" "Captura de Pacotes (tcpdump)" \
             "13" "SNMPwalk" \
-            "14" "Proxmox - Usuario e Zabbix-Agent2 (EM VALIDACAO)" \
+            "14" "Proxmox - Usuario e Zabbix-Agent2" \
             "15" "Status dos Servicos" \
             "16" "Reiniciar Servico" \
             "17" "Sair" \
