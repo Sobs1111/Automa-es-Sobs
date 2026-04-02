@@ -1328,10 +1328,61 @@ fn_alterar_senha() {
     whiptail --title "Concluido" --msgbox "Senha do usuario '$nome' alterada com sucesso." 8 55
 }
 
+fn_snmpwalk() {
+    which snmpwalk &>/dev/null || apt-get install -y snmp
+
+    versao=$(whiptail --title "SNMPwalk - Versao" \
+        --menu "Selecione a versao SNMP:" 10 50 2 \
+        "1" "v1" \
+        "2" "v2c" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    local snmp_ver
+    [[ "$versao" == "1" ]] && snmp_ver="1" || snmp_ver="2c"
+
+    ip_alvo=$(whiptail --title "SNMPwalk - IP" \
+        --inputbox "IP do dispositivo alvo:" 8 50 \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$ip_alvo" ]] && return 1
+
+    community=$(whiptail --title "SNMPwalk - Community" \
+        --menu "Selecione a community:" 12 55 3 \
+        "1" "1Pv7sNMPC0m" \
+        "2" "M4tr1Xc0rP" \
+        "3" "Outra" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    case "$community" in
+        1) comm="1Pv7sNMPC0m" ;;
+        2) comm="M4tr1Xc0rP" ;;
+        3)
+            comm=$(whiptail --title "SNMPwalk - Community" \
+                --inputbox "Digite a community:" 8 50 \
+                3>&1 1>&2 2>&3)
+            [[ $? -ne 0 || -z "$comm" ]] && return 1
+            ;;
+    esac
+
+    oid=$(whiptail --title "SNMPwalk - OID" \
+        --inputbox "OID (deixe vazio para consultar tudo):" 8 60 \
+        3>&1 1>&2 2>&3)
+
+    local cmd="snmpwalk -v$snmp_ver -c $comm $ip_alvo"
+    [[ -n "$oid" ]] && cmd+=" $oid"
+
+    whiptail --title "SNMPwalk" --msgbox "Executando consulta. O resultado sera exibido no terminal.\n\nComando: $cmd" 10 70
+
+    eval "$cmd"
+
+    whiptail --title "SNMPwalk" --msgbox "Consulta finalizada. Pressione Ok para voltar ao menu." 8 55
+}
+
 menu() {
     while true; do
         choice=$(whiptail --title "Hub de Configuracoes" \
-            --menu "Selecione uma opcao:" 32 65 16 \
+            --menu "Selecione uma opcao:" 34 65 16 \
             "1"  "Instalar DNS Unbound Recursivo" \
             "2"  "Instalar DNS Unbound Reverso" \
             "3"  "Instalar Monitor do Unbound" \
@@ -1344,9 +1395,10 @@ menu() {
             "10" "Gerencia de Usuarios" \
             "11" "Verificar Requisitos da Maquina" \
             "12" "Captura de Pacotes (tcpdump)" \
-            "13" "Status dos Servicos" \
-            "14" "Reiniciar Servico" \
-            "15" "Sair" \
+            "13" "SNMPwalk" \
+            "14" "Status dos Servicos" \
+            "15" "Reiniciar Servico" \
+            "16" "Sair" \
             3>&1 1>&2 2>&3)
 
         exitstatus=$?
@@ -1365,9 +1417,10 @@ menu() {
             10) fn_gerencia_usuarios ;;
             11) fn_requisitos ;;
             12) fn_tcpdump ;;
-            13) fn_status_servicos ;;
-            14) fn_reiniciar_servico ;;
-            15) exit 0 ;;
+            13) fn_snmpwalk ;;
+            14) fn_status_servicos ;;
+            15) fn_reiniciar_servico ;;
+            16) exit 0 ;;
         esac
     done
 }
