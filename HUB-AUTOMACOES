@@ -1643,10 +1643,676 @@ ANALISE:
   IPv6 : $analise_v6" 28 65
 }
 
+fn_iptables_anycast() {
+    apt install iptables iptables-persistent -y
+
+    declare -a ssh_origins
+    while true; do
+        ssh_src=$(whiptail --title "iptables - SSH" \
+            --inputbox "Origem permitida para SSH (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$ssh_src" ]] && break
+        ssh_origins+=("$ssh_src")
+    done
+
+    for ipt in iptables ip6tables; do
+        $ipt -F
+        $ipt -P INPUT DROP
+        $ipt -P FORWARD DROP
+        $ipt -P OUTPUT ACCEPT
+        $ipt -A INPUT -i lo -j ACCEPT
+        $ipt -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+    done
+
+    iptables -A INPUT -p icmp -j ACCEPT
+    iptables -A OUTPUT -p icmp -j ACCEPT
+    ip6tables -I INPUT 1 -p ipv6-icmp -j ACCEPT
+    ip6tables -A OUTPUT -p ipv6-icmp -j ACCEPT
+
+    for src in "${ssh_origins[@]}"; do
+        if [[ "$src" == *:* ]]; then
+            ip6tables -A INPUT -p tcp -s "$src" --dport 22 -j ACCEPT
+        else
+            iptables -A INPUT -p tcp -s "$src" --dport 22 -j ACCEPT
+        fi
+    done
+
+    local blocos_acl=()
+    [[ $acl_redes_internas -eq 0 ]] && blocos_acl+=("127.0.0.0/8" "100.64.0.0/10" "10.0.0.0/8" "172.16.0.0/16")
+    for b in "${acl_blocks[@]}"; do blocos_acl+=("$b"); done
+
+    if [[ ${#blocos_acl[@]} -gt 0 ]]; then
+        local blocos_fmt=""
+        for b in "${blocos_acl[@]}"; do blocos_fmt+="  $b\n"; done
+
+        whiptail --title "iptables - DNS porta 53" \
+            --yesno "Os seguintes blocos foram liberados no Unbound:\n\n${blocos_fmt}\nDeseja liberar os mesmos na porta 53 do iptables?" 18 60
+        if [[ $? -eq 0 ]]; then
+            for block in "${blocos_acl[@]}"; do
+                if [[ "$block" == *:* ]]; then
+                    ip6tables -A INPUT -p tcp -s "$block" --dport 53 -j ACCEPT
+                    ip6tables -A INPUT -p udp -s "$block" --dport 53 -j ACCEPT
+                else
+                    iptables -A INPUT -p tcp -s "$block" --dport 53 -j ACCEPT
+                    iptables -A INPUT -p udp -s "$block" --dport 53 -j ACCEPT
+                fi
+            done
+        else
+            while true; do
+                dns_src=$(whiptail --title "iptables - DNS porta 53" \
+                    --inputbox "Origem para porta 53 (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
+                    3>&1 1>&2 2>&3)
+                [[ $? -ne 0 || -z "$dns_src" ]] && break
+                if [[ "$dns_src" == *:* ]]; then
+                    ip6tables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
+                    ip6tables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
+                else
+                    iptables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
+                    iptables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
+                fi
+            done
+        fi
+    fi
+
+    if systemctl is-active --quiet zabbix-agent2 2>/dev/null; then
+        zabbix_src=$(whiptail --title "iptables - Zabbix" \
+            --inputbox "Origem para porta 10050 do Zabbix (CIDR ou IP):" 10 60 \
+            3>&1 1>&2 2>&3)
+        if [[ $? -eq 0 && -n "$zabbix_src" ]]; then
+            if [[ "$zabbix_src" == *:* ]]; then
+                ip6tables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
+                ip6tables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
+            else
+                iptables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
+                iptables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
+            fi
+        fi
+    fi
+
+    while true; do
+        porta_custom=$(whiptail --title "iptables - Porta Customizada" \
+            --inputbox "Porta adicional para liberar (deixe vazio para finalizar):" 8 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$porta_custom" ]] && break
+
+        whiptail --title "iptables - Porta $porta_custom" \
+            --yesno "Liberar porta $porta_custom para qualquer origem?" 8 55
+        if [[ $? -eq 0 ]]; then
+            for ipt in iptables ip6tables; do
+                $ipt -A INPUT -p tcp --dport "$porta_custom" -j ACCEPT
+                $ipt -A INPUT -p udp --dport "$porta_custom" -j ACCEPT
+            done
+        else
+            while true; do
+                custom_src=$(whiptail --title "iptables - Porta $porta_custom" \
+                    --inputbox "Origem para porta $porta_custom (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
+                    3>&1 1>&2 2>&3)
+                [[ $? -ne 0 || -z "$custom_src" ]] && break
+                if [[ "$custom_src" == *:* ]]; then
+                    ip6tables -A INPUT -p tcp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
+                    ip6tables -A INPUT -p udp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
+                else
+                    iptables -A INPUT -p tcp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
+                    iptables -A INPUT -p udp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
+                fi
+            done
+        fi
+    done
+
+    if systemctl cat frr &>/dev/null; then
+        for ipt in iptables ip6tables; do
+            $ipt -A INPUT -p ospf -j ACCEPT
+            $ipt -A OUTPUT -p ospf -j ACCEPT
+        done
+    fi
+
+    netfilter-persistent save
+    whiptail --title "Concluido" --msgbox "Regras de iptables (IPv4 e IPv6) aplicadas e salvas." 8 55
+}
+
+fn_configurar_loopbacks() {
+    declare -a lo_ipv4s=()
+    declare -a lo_ipv6s=()
+
+    whiptail --title "Loopbacks - IPv4" --msgbox \
+"Informe os IPs IPv4 a adicionar na loopback.
+Ex: 192.0.2.1/32 (use seus IPs publicos reais)" 8 60
+
+    while true; do
+        lo_ip=$(whiptail --title "Loopbacks - IPv4" \
+            --inputbox "IP IPv4 com mascara (ex: 192.0.2.1/32)\nDeixe vazio para finalizar:" 10 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$lo_ip" ]] && break
+        lo_ipv4s+=("$lo_ip")
+    done
+
+    whiptail --title "Loopbacks - IPv6" --msgbox \
+"Informe os IPs IPv6 a adicionar na loopback.
+Ex: 2001:db8::1/128 (use seus IPs publicos reais)" 8 65
+
+    while true; do
+        lo_ip6=$(whiptail --title "Loopbacks - IPv6" \
+            --inputbox "IP IPv6 com mascara (ex: 2001:db8::1/128)\nDeixe vazio para finalizar:" 10 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$lo_ip6" ]] && break
+        lo_ipv6s+=("$lo_ip6")
+    done
+
+    if [[ ${#lo_ipv4s[@]} -eq 0 && ${#lo_ipv6s[@]} -eq 0 ]]; then
+        whiptail --title "Loopbacks" --msgbox "Nenhum IP informado. Operacao cancelada." 8 50
+        return 1
+    fi
+
+    local interfaces_file="/etc/network/interfaces"
+
+    if ! grep -q "iface lo inet loopback" "$interfaces_file"; then
+        whiptail --title "Erro" --msgbox "Bloco 'iface lo inet loopback' nao encontrado em $interfaces_file." 8 60
+        return 1
+    fi
+
+    if grep -q "up ip addr add" "$interfaces_file"; then
+        sed -i '/up ip addr add/d' "$interfaces_file"
+        sed -i '/down ip addr del/d' "$interfaces_file"
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    while IFS= read -r line; do
+        echo "$line" >> "$tmp"
+        if [[ "$line" == *"iface lo inet loopback"* ]]; then
+            for ip in "${lo_ipv4s[@]}"; do echo "    up ip addr add $ip dev lo" >> "$tmp"; done
+            for ip in "${lo_ipv6s[@]}"; do echo "    up ip addr add $ip dev lo" >> "$tmp"; done
+            for ip in "${lo_ipv4s[@]}"; do echo "    down ip addr del $ip dev lo" >> "$tmp"; done
+            for ip in "${lo_ipv6s[@]}"; do echo "    down ip addr del $ip dev lo" >> "$tmp"; done
+        fi
+    done < "$interfaces_file"
+    mv "$tmp" "$interfaces_file"
+
+    local resumo=""
+    for ip in "${lo_ipv4s[@]}"; do resumo+="  $ip\n"; done
+    for ip in "${lo_ipv6s[@]}"; do resumo+="  $ip\n"; done
+
+    whiptail --title "Loopbacks - Confirmacao" \
+        --yesno "IPs a configurar:\n\n${resumo}\nAplicar agora com ifdown/ifup lo?" 16 60
+    if [[ $? -eq 0 ]]; then
+        ifdown lo && ifup lo
+        whiptail --title "Concluido" --msgbox "Loopbacks configuradas e aplicadas com sucesso." 8 55
+    else
+        whiptail --title "Concluido" --msgbox "Loopbacks salvas em $interfaces_file.\nExecute 'ifdown lo && ifup lo' para aplicar." 10 60
+    fi
+}
+
+fn_coletar_dados_anycast() {
+    hostname_frr=$(whiptail --title "FRR - Hostname" \
+        --inputbox "Hostname do roteador FRR\n(ex: DNS-ANYCAST-01):" 10 60 \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$hostname_frr" ]] && return 1
+
+    router_id=$(whiptail --title "FRR - Router ID" \
+        --inputbox "Router ID do OSPF\n(ex: 177.137.208.82 - geralmente o IP publico principal):" 10 65 \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$router_id" ]] && return 1
+
+    mapfile -t ifaces_disp < <(ip link show | awk -F': ' '/^[0-9]+: / && !/lo/ {print $2}' | awk '{print $1}')
+    local iface_opts=()
+    for iface_item in "${ifaces_disp[@]}"; do iface_opts+=("$iface_item" ""); done
+
+    iface_ospf=$(whiptail --title "FRR - Interface OSPF" \
+        --menu "Selecione a interface de rede para o OSPF:" 20 60 8 \
+        "${iface_opts[@]}" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$iface_ospf" ]] && return 1
+
+    cpu_count=$(nproc)
+    num_threads=$(whiptail --title "Unbound - Threads" \
+        --inputbox "Numero de threads do Unbound\n(CPUs detectadas: ${cpu_count} | recomendado: ${cpu_count}):" 10 65 "$cpu_count" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 || -z "$num_threads" ]] && num_threads="$cpu_count"
+
+    mapfile -t unbound_interfaces < <(ip -4 addr show | awk '/inet / {print $2}' | cut -d/ -f1)
+    mapfile -t ipv6_ifaces < <(ip -6 addr show | awk '/inet6 / {print $2}' | cut -d/ -f1 | grep -v '^fe80')
+
+    local msg_ifaces="IPs detectados para o Unbound escutar:\n\nIPv4:\n"
+    for ip in "${unbound_interfaces[@]}"; do msg_ifaces+="  $ip\n"; done
+    msg_ifaces+="\nIPv6:\n"
+    for ip in "${ipv6_ifaces[@]}"; do msg_ifaces+="  $ip\n"; done
+    msg_ifaces+="\nDeseja prosseguir com esses enderecos?"
+
+    whiptail --title "Unbound - Interfaces Detectadas" --yesno "$msg_ifaces" 22 60
+    [[ $? -ne 0 ]] && return 1
+
+    for ip in "${ipv6_ifaces[@]}"; do unbound_interfaces+=("$ip"); done
+
+    outgoing_ipv4=""
+    outgoing_ipv6=""
+
+    mapfile -t all_ipv4s < <(ip -4 addr show | awk '/inet / {print $2}' | cut -d/ -f1 | grep -v '^127\.')
+    if [[ ${#all_ipv4s[@]} -gt 0 ]]; then
+        local pub_opts=()
+        pub_opts+=("" "Nao definir outgoing IPv4")
+        for pub_ip in "${all_ipv4s[@]}"; do pub_opts+=("$pub_ip" ""); done
+        outgoing_ipv4=$(whiptail --title "Unbound - Outgoing IPv4" \
+            --menu "Selecione o IP de saida para queries externas:\n(recomendado: IP publico da WAN)" 18 65 10 \
+            "${pub_opts[@]}" \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || "$outgoing_ipv4" == "" ]] && outgoing_ipv4=""
+    fi
+
+    outgoing_ipv6=$(whiptail --title "Unbound - Outgoing IPv6" \
+        --inputbox "IP de saida IPv6 (outgoing-interface)\n(ex: 2804:978:99::1 | deixe vazio para ignorar):" 10 65 \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && outgoing_ipv6=""
+
+    declare -g -a acl_blocks=()
+    declare -g acl_redes_internas=0
+
+    whiptail --title "Unbound - ACL Redes Internas" \
+        --yesno "Deseja liberar automaticamente as redes privadas internas?\n\n  127.0.0.0/8\n  100.64.0.0/10\n  10.0.0.0/8\n  172.16.0.0/16" 14 60
+    acl_redes_internas=$?
+
+    whiptail --title "Unbound - ACL" --msgbox \
+"Informe os blocos CIDR adicionais permitidos para consulta DNS.
+Ex: 177.137.208.0/20, 2804:978::/32
+Deixe vazio para finalizar." 10 65
+
+    while true; do
+        acl_block=$(whiptail --title "Unbound - ACL" \
+            --inputbox "Bloco permitido (CIDR)\n(deixe vazio para finalizar):" 10 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$acl_block" ]] && break
+        acl_blocks+=("$acl_block")
+    done
+
+    zabbix_server_ip=$(whiptail --title "Zabbix - Servidor" \
+        --inputbox "IP do Zabbix Server ou Proxy\n(pode alterar depois em /etc/zabbix/zabbix_agent2.conf):" 10 65 \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && zabbix_server_ip="0.0.0.0/0"
+}
+
+fn_instalar_pacotes_anycast() {
+    apt update && apt full-upgrade -y
+    apt install -y \
+        net-tools nftables htop iotop sipcalc tcpdump curl gnupg \
+        rsync wget host dnsutils mtr-tiny bmon sudo tmux whois \
+        ethtool unbound dns-root-data irqbalance chrony
+}
+
+fn_configurar_sysctl_anycast() {
+    cat > /etc/sysctl.d/99-anycast.conf <<EOF
+net.ipv6.conf.all.forwarding = 2
+net.core.rmem_max = 2147483647
+net.core.wmem_max = 2147483647
+net.ipv4.tcp_rmem = 4096 87380 2147483647
+net.ipv4.tcp_wmem = 4096 65536 2147483647
+net.netfilter.nf_conntrack_buckets = 512000
+net.netfilter.nf_conntrack_max = 4096000
+vm.swappiness = 10
+EOF
+    echo nf_conntrack >> /etc/modules
+    modprobe nf_conntrack
+    sysctl -p /etc/sysctl.d/99-anycast.conf
+}
+
+fn_instalar_frr_anycast() {
+    curl -s https://deb.frrouting.org/frr/keys.asc | \
+        gpg --dearmor -o /usr/share/keyrings/frrouting-archive-keyring.gpg
+
+    echo \
+"deb [signed-by=/usr/share/keyrings/frrouting-archive-keyring.gpg] https://deb.frrouting.org/frr \
+$(lsb_release -cs) frr-stable" | tee /etc/apt/sources.list.d/frr.list > /dev/null
+
+    apt update
+    apt install -y frr frr-doc frr-pythontools
+    apt-mark hold frr frr-doc frr-pythontools
+}
+
+fn_configurar_frr_anycast() {
+    sed -i 's/^ospfd=no/ospfd=yes/' /etc/frr/daemons
+    sed -i 's/^ospf6d=no/ospf6d=yes/' /etc/frr/daemons
+
+    cat > /etc/frr/frr.conf <<EOF
+log syslog informational
+
+frr defaults traditional
+hostname ${hostname_frr}
+no ip forwarding
+no ipv6 forwarding
+service integrated-vtysh-config
+!
+interface ${iface_ospf}
+ ip ospf area 0
+ ip ospf network point-to-point
+ ipv6 ospf6 area 0
+ ipv6 ospf6 network point-to-point
+exit
+!
+interface lo
+ ip ospf area 0
+ ipv6 ospf6 area 0
+exit
+!
+router ospf
+ ospf router-id ${router_id}
+exit
+!
+router ospf6
+ ospf6 router-id ${router_id}
+exit
+EOF
+    systemctl enable frr
+    systemctl restart frr
+}
+
+fn_instalar_unbound_anycast() {
+    mkdir -p /etc/unbound/unbound.conf.d
+    mkdir -p /var/log/unbound
+    touch /var/log/unbound/unbound.log
+    chown -R unbound:unbound /var/log/unbound/
+
+    cat > /etc/unbound/unbound.conf <<EOF
+include: "/etc/unbound/unbound.conf.d/*.conf"
+EOF
+    touch /etc/unbound/blacklist.conf
+    touch /etc/unbound/local_zone.conf
+}
+
+fn_configurar_unbound_anycast() {
+    local slabs=4
+    (( num_threads > 8 )) && slabs=8
+
+    {
+        echo "server:"
+        echo "    verbosity: 1"
+        echo "    statistics-interval: 0"
+        echo "    statistics-cumulative: no"
+        echo "    extended-statistics: yes"
+        echo "    num-threads: $num_threads"
+        echo "    serve-expired: yes"
+        for ip in "${unbound_interfaces[@]}"; do echo "    interface: $ip"; done
+        echo "    interface-automatic: no"
+        [[ -n "$outgoing_ipv4" ]] && echo "    outgoing-interface: $outgoing_ipv4"
+        [[ -n "$outgoing_ipv6" ]] && echo "    outgoing-interface: $outgoing_ipv6"
+        echo "    outgoing-range: 8192"
+        echo "    outgoing-num-tcp: 1024"
+        echo "    incoming-num-tcp: 2048"
+        echo "    so-rcvbuf: 8m"
+        echo "    so-sndbuf: 8m"
+        echo "    so-reuseport: yes"
+        echo "    edns-buffer-size: 1232"
+        echo "    msg-cache-size: 1g"
+        echo "    msg-cache-slabs: $slabs"
+        echo "    num-queries-per-thread: 4096"
+        echo "    rrset-cache-size: 2g"
+        echo "    rrset-cache-slabs: $slabs"
+        echo "    infra-cache-slabs: $slabs"
+        echo "    key-cache-slabs: $slabs"
+        echo "    do-ip4: yes"
+        echo "    do-ip6: yes"
+        echo "    do-udp: yes"
+        echo "    do-tcp: yes"
+        echo "    chroot: \"\""
+        echo "    username: \"unbound\""
+        echo "    directory: \"/etc/unbound\""
+        echo "    logfile: \"/var/log/unbound/unbound.log\""
+        echo "    use-syslog: no"
+        echo "    log-time-ascii: yes"
+        echo "    log-queries: no"
+        echo "    pidfile: \"/var/run/unbound.pid\""
+        echo "    root-hints: \"/usr/share/dns/root.hints\""
+        echo "    hide-identity: yes"
+        echo "    hide-version: yes"
+        echo "    unwanted-reply-threshold: 10000000"
+        echo "    prefetch: yes"
+        echo "    prefetch-key: yes"
+        echo "    rrset-roundrobin: yes"
+        echo "    minimal-responses: yes"
+        echo "    module-config: \"respip validator iterator\""
+        echo "    val-clean-additional: yes"
+        echo "    val-log-level: 1"
+        echo "    deny-any: yes"
+        echo "    include: /etc/unbound/local_zone.conf"
+        echo "    include: /etc/unbound/blacklist.conf"
+        echo "    include: /etc/unbound/acl.conf"
+    } > /etc/unbound/unbound.conf.d/server.conf
+
+    {
+        echo "access-control: 127.0.0.0/8 allow"
+        echo "access-control: ::1/128 allow"
+        if [[ $acl_redes_internas -eq 0 ]]; then
+            echo "access-control: 100.64.0.0/10 allow"
+            echo "access-control: 10.0.0.0/8 allow"
+            echo "access-control: 172.16.0.0/16 allow"
+        fi
+        for block in "${acl_blocks[@]}"; do echo "access-control: $block allow"; done
+    } > /etc/unbound/acl.conf
+
+    cat > /etc/unbound/unbound.conf.d/statistics-enable.conf <<EOF
+server:
+    statistics-interval: 0
+    statistics-cumulative: no
+    extended-statistics: yes
+
+remote-control:
+    control-enable: yes
+    control-interface: 127.0.0.1
+    control-port: 8953
+    server-key-file: "/etc/unbound/unbound_server.key"
+    server-cert-file: "/etc/unbound/unbound_server.pem"
+    control-key-file: "/etc/unbound/unbound_control.key"
+    control-cert-file: "/etc/unbound/unbound_control.pem"
+EOF
+
+    unbound-control-setup
+    systemctl enable unbound
+    systemctl restart unbound
+}
+
+fn_configurar_irqbalance_anycast() {
+    systemctl enable irqbalance
+    systemctl start irqbalance
+}
+
+fn_configurar_chrony_anycast() {
+    cat >> /etc/chrony/chrony.conf <<EOF
+server a.st1.ntp.br iburst nts
+server b.st1.ntp.br iburst nts
+server c.st1.ntp.br iburst nts
+server d.st1.ntp.br iburst nts
+EOF
+    systemctl restart chronyd
+}
+
+fn_configurar_logrotate_anycast() {
+    cat > /etc/logrotate.d/unbound <<EOF
+/var/log/unbound/unbound.log {
+    rotate 5
+    weekly
+    compress
+    delaycompress
+    postrotate
+        unbound-control log_reopen
+    endscript
+}
+EOF
+    systemctl restart logrotate
+}
+
+fn_zabbix_anycast() {
+    if dpkg -l zabbix-agent 2>/dev/null | grep -q '^ii'; then
+        apt remove zabbix-agent -y
+        apt autoremove -y
+    fi
+
+    apt install -y zabbix-agent2
+
+    sys_hostname=$(hostname)
+    local conf="/etc/zabbix/zabbix_agent2.conf"
+
+    if [[ ! -f "$conf" ]]; then
+        mkdir -p /etc/zabbix/zabbix_agent2.d
+        cat > "$conf" <<EOF
+PidFile=/var/run/zabbix/zabbix_agent2.pid
+LogFile=/var/log/zabbix/zabbix_agent2.log
+LogFileSize=0
+Server=${zabbix_server_ip}
+ServerActive=${zabbix_server_ip}
+Hostname=${sys_hostname}
+Include=/etc/zabbix/zabbix_agent2.d/*.conf
+EOF
+    else
+        sed -i "s/^Server=.*/Server=${zabbix_server_ip}/" "$conf"
+        sed -i "s/^ServerActive=.*/ServerActive=${zabbix_server_ip}/" "$conf"
+        sed -i "s/^Hostname=.*/Hostname=${sys_hostname}/" "$conf"
+    fi
+
+    apt install -y sudo
+
+    cat > /etc/sudoers.d/zabbix-agent <<EOF
+Defaults:zabbix !requiretty
+zabbix ALL = NOPASSWD: /usr/sbin/unbound-control
+EOF
+    chmod 0440 /etc/sudoers.d/zabbix-agent
+
+    if ! grep -q "unbound-control stats_noreset" /etc/sudoers; then
+        echo "zabbix ALL=(ALL) NOPASSWD: /usr/sbin/unbound-control stats_noreset" >> /etc/sudoers
+    fi
+
+    usermod -a -G unbound zabbix
+
+    mkdir -p /etc/zabbix/zabbix_agent2.d
+    cat > /etc/zabbix/zabbix_agent2.d/userparameter_unbound.conf <<'EOF'
+UserParameter=unbound.service,systemctl is-active unbound >/dev/null 2>&1 && echo 1 || echo 0
+UserParameter=unbound.service.status,systemctl status unbound --no-pager -l 2>/dev/null | head -3 | tail -1 | awk '{print $2}' || echo "unknown"
+UserParameter=unbound.time.up,sudo /usr/sbin/unbound-control stats_noreset | grep "time.up=" | cut -d= -f2
+UserParameter=unbound.time.now,sudo /usr/sbin/unbound-control stats_noreset | grep "time.now=" | cut -d= -f2
+UserParameter=unbound.time.elapsed,sudo /usr/sbin/unbound-control stats_noreset | grep "time.elapsed=" | cut -d= -f2
+UserParameter=unbound.num.cachehits,sudo /usr/sbin/unbound-control stats_noreset | grep "num.cachehits=" | cut -d= -f2
+UserParameter=unbound.num.cachemiss,sudo /usr/sbin/unbound-control stats_noreset | grep "num.cachemiss=" | cut -d= -f2
+UserParameter=unbound.cache.hitrate,sudo /usr/sbin/unbound-control stats_noreset | awk '/num.cachehits=/{h=$2} /num.cachemiss=/{m=$2} END{total=h+m; if(total>0) printf "%.2f", (h/total)*100; else print 0}' FS='='
+UserParameter=unbound.cache.size,sudo /usr/sbin/unbound-control stats_noreset | grep "msg.cache.count=" | cut -d= -f2
+UserParameter=unbound.rrset.cache.size,sudo /usr/sbin/unbound-control stats_noreset | grep "rrset.cache.count=" | cut -d= -f2
+UserParameter=unbound.mem.total,sudo /usr/sbin/unbound-control stats_noreset | awk '/^mem\./{sum += $2} END{print sum}' FS='='
+UserParameter=unbound.mem[*],sudo /usr/sbin/unbound-control stats_noreset | grep "mem.$1=" | cut -d= -f2
+UserParameter=unbound.mem.cache,sudo /usr/sbin/unbound-control stats_noreset | grep "mem.cache.message=" | cut -d= -f2
+UserParameter=unbound.mem.cache.rrset,sudo /usr/sbin/unbound-control stats_noreset | grep "mem.cache.rrset=" | cut -d= -f2
+UserParameter=unbound.total[*],sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.$1=" | cut -d= -f2
+UserParameter=unbound.total.queries,sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.queries=" | cut -d= -f2
+UserParameter=unbound.total.cachehits,sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.cachehits=" | cut -d= -f2
+UserParameter=unbound.total.cachemiss,sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.cachemiss=" | cut -d= -f2
+UserParameter=unbound.num.queries.sent,sudo /usr/sbin/unbound-control stats_noreset | grep "num.queries.sent=" | cut -d= -f2
+UserParameter=unbound.num.query.recurse,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.recurse=" | cut -d= -f2
+UserParameter=unbound.num.query.edns,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.edns=" | cut -d= -f2
+UserParameter=unbound.num.query.dnssec,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.dnssec=" | cut -d= -f2
+UserParameter=unbound.num.prefetch,sudo /usr/sbin/unbound-control stats_noreset | grep "num.prefetch=" | cut -d= -f2
+UserParameter=unbound.num.expired,sudo /usr/sbin/unbound-control stats_noreset | grep "num.expired=" | cut -d= -f2
+UserParameter=unbound.num.recursivereplies,sudo /usr/sbin/unbound-control stats_noreset | grep "num.recursivereplies=" | cut -d= -f2
+UserParameter=unbound.num.query.flagQR,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagQR=" | cut -d= -f2
+UserParameter=unbound.num.query.flagAA,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagAA=" | cut -d= -f2
+UserParameter=unbound.num.query.flagTC,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagTC=" | cut -d= -f2
+UserParameter=unbound.num.query.flagRD,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagRD=" | cut -d= -f2
+UserParameter=unbound.num.query.flagRA,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagRA=" | cut -d= -f2
+UserParameter=unbound.num.query.flagZ,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagZ=" | cut -d= -f2
+UserParameter=unbound.num.query.flagAD,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagAD=" | cut -d= -f2
+UserParameter=unbound.num.query.flagCD,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagCD=" | cut -d= -f2
+UserParameter=unbound.flag[*],sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.$1=" | cut -d= -f2
+UserParameter=unbound.type[*],echo -n 0; sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.$1=" | cut -d= -f2
+UserParameter=unbound.type.A,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.A=" | cut -d= -f2
+UserParameter=unbound.type.AAAA,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.AAAA=" | cut -d= -f2
+UserParameter=unbound.type.MX,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.MX=" | cut -d= -f2
+UserParameter=unbound.type.TXT,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.TXT=" | cut -d= -f2
+UserParameter=unbound.type.PTR,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.PTR=" | cut -d= -f2
+UserParameter=unbound.type.CNAME,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.CNAME=" | cut -d= -f2
+UserParameter=unbound.type.NS,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.NS=" | cut -d= -f2
+UserParameter=unbound.rcode[*],sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.$1=" | cut -d= -f2
+UserParameter=unbound.rcode.NOERROR,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.NOERROR=" | cut -d= -f2
+UserParameter=unbound.rcode.NXDOMAIN,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.NXDOMAIN=" | cut -d= -f2
+UserParameter=unbound.rcode.SERVFAIL,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.SERVFAIL=" | cut -d= -f2
+UserParameter=unbound.rcode.REFUSED,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.REFUSED=" | cut -d= -f2
+UserParameter=unbound.class[*],sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.class.$1=" | cut -d= -f2
+UserParameter=unbound.class.IN,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.class.IN=" | cut -d= -f2
+UserParameter=unbound.histogram[*],sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.$1=" | cut -d= -f2
+UserParameter=unbound.histogram.custom[*],sudo /usr/sbin/unbound-control stats_noreset | awk -F= '/histogram.$1/{sub(/.ms total/, "", $1); print $2}'
+UserParameter=unbound.histogram.total[*],sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.$1=" | cut -d= -f2
+UserParameter=unbound.histogram.avg,sudo /usr/sbin/unbound-control stats_noreset | awk '/^histogram\./{split($1,a,"."); if(a[2]!="bucket") {time=a[2]; gsub("ms","",time); queries=$2; total_time+=time*queries; total_queries+=queries}} END{if(total_queries>0) printf "%.2f", total_time/total_queries; else print 0}' FS='='
+UserParameter=unbound.num.query.https,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.HTTPS=" | cut -d= -f2
+UserParameter=unbound.num.query.dnskey,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.DNSKEY=" | cut -d= -f2
+UserParameter=unbound.num.query.ds,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.DS=" | cut -d= -f2
+UserParameter=unbound.num.answer.secure,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.secure=" | cut -d= -f2
+UserParameter=unbound.num.answer.bogus,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.bogus=" | cut -d= -f2
+UserParameter=unbound.thread[*],sudo /usr/sbin/unbound-control stats_noreset | grep "thread$1.num.queries=" | cut -d= -f2
+UserParameter=unbound.unwanted.queries,sudo /usr/sbin/unbound-control stats_noreset | grep "unwanted.queries=" | cut -d= -f2
+UserParameter=unbound.unwanted.replies,sudo /usr/sbin/unbound-control stats_noreset | grep "unwanted.replies=" | cut -d= -f2
+UserParameter=unbound.process.cpu,ps -C unbound -o pid,pcpu | grep -v PID | awk '{sum += $2} END{print sum}'
+UserParameter=unbound.process.memory,ps -C unbound -o pid,rss | grep -v PID | awk '{sum += $2} END{print sum*1024}'
+UserParameter=unbound.process.count,pgrep -c unbound
+UserParameter=unbound.discovery.types,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type" | sed 's/num.query.type.//g' | cut -d= -f1 | awk '{print "{\"" $0 "\"}"}'
+UserParameter=unbound.discovery.rcodes,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode" | sed 's/num.answer.rcode.//g' | cut -d= -f1 | awk '{print "{\"" $0 "\"}"}'
+UserParameter=unbound.test.query,timeout 5 dig @127.0.0.1 google.com >/dev/null 2>&1 && echo 1 || echo 0
+UserParameter=unbound.test.response.time,timeout 5 dig @127.0.0.1 google.com | grep "Query time:" | awk '{print $4}' 2>/dev/null || echo 0
+UserParameter=unbound.efficiency,sudo /usr/sbin/unbound-control stats_noreset | awk "/total.num.cachehits=/{h=\$2} /total.num.queries=/{q=\$2} END{if(q>0) printf \"%.2f\", (h/q)*100; else print 0}" FS="="
+UserParameter=unbound.dns.status,systemctl is-active unbound >/dev/null 2>&1 && echo 1 || echo 0
+UserParameter=unbound.stats[*],sudo /usr/sbin/unbound-control stats_noreset | grep "^$1=" | cut -d= -f2
+UserParameter=unbound.qps.total,sudo /usr/sbin/unbound-control stats | grep "total.num.queries=" | cut -d= -f2 | awk '{print $1/60}'
+UserParameter=unbound.qps.cachehits,sudo /usr/sbin/unbound-control stats | grep "total.num.cachehits=" | cut -d= -f2 | awk '{print $1/60}'
+UserParameter=unbound.qps.type[*],sudo /usr/sbin/unbound-control stats | grep "num.query.type.$1=" | cut -d= -f2 | awk '{print $1/60}'
+UserParameter=unbound.histogram.0.016to0.032,sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.0000000.016000.032000.to.0000000.032000.064000=" | cut -d= -f2
+UserParameter=unbound.histogram.2.048to4.096,sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.0000002.048000.000000.to.0000004.096000.000000=" | cut -d= -f2
+UserParameter=unbound.query.ipv6,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.ipv6=" | cut -d= -f2
+EOF
+
+    chmod 644 /etc/zabbix/zabbix_agent2.d/userparameter_unbound.conf
+    systemctl enable --now zabbix-agent2
+    systemctl restart zabbix-agent2
+
+    whiptail --title "Zabbix Agent2" --msgbox \
+"Zabbix Agent2 configurado com sucesso.
+
+  Hostname : ${sys_hostname}
+  Server   : ${zabbix_server_ip}" 10 55
+}
+
+fn_anycast() {
+    whiptail --title "DNS-RECURSIVO-ANYCAST" --yesno \
+"Deseja configurar as loopbacks agora?" 8 50
+    [[ $? -eq 0 ]] && fn_configurar_loopbacks
+
+    whiptail --title "DNS-RECURSIVO-ANYCAST" --yesno \
+"Deseja prosseguir com a instalacao?" 8 50
+    [[ $? -ne 0 ]] && return 1
+
+    fn_coletar_dados_anycast
+    fn_instalar_pacotes_anycast
+    fn_configurar_sysctl_anycast
+    fn_instalar_frr_anycast
+    fn_configurar_frr_anycast
+    fn_instalar_unbound_anycast
+    fn_configurar_unbound_anycast
+    fn_configurar_irqbalance_anycast
+    fn_configurar_chrony_anycast
+    fn_configurar_logrotate_anycast
+
+    whiptail --title "DNS-RECURSIVO-ANYCAST" --yesno \
+"Deseja instalar e configurar o Zabbix-Agent2?" 8 55
+    [[ $? -eq 0 ]] && fn_zabbix_anycast
+
+    whiptail --title "DNS-RECURSIVO-ANYCAST" --yesno \
+"Deseja configurar o iptables?" 8 50
+    [[ $? -eq 0 ]] && fn_iptables_anycast
+
+    whiptail --title "Concluido" --msgbox \
+"Instalacao do DNS-RECURSIVO-ANYCAST concluida.
+
+Verifique o OSPF com:
+  vtysh -c 'show ip ospf neighbor'
+  vtysh -c 'show ipv6 ospf6 neighbor'
+
+Pode levar ate 2 minutos para fechar apos reiniciar." 14 60
+}
+
 menu() {
     while true; do
         choice=$(whiptail --title "Hub de Configuracoes" \
-            --menu "Selecione uma opcao:" 38 65 18 \
+            --menu "Selecione uma opcao:" 40 65 19 \
             "1"  "Instalar DNS Unbound Recursivo" \
             "2"  "Instalar DNS Unbound Reverso" \
             "3"  "Instalar Monitor do Unbound" \
@@ -1662,9 +2328,10 @@ menu() {
             "13" "SNMPwalk" \
             "14" "Proxmox - Usuario e Zabbix-Agent2" \
             "15" "Teste DNS Unbound (IPv4 e IPv6)" \
-            "16" "Status dos Servicos" \
-            "17" "Reiniciar Servico" \
-            "18" "Sair" \
+            "16" "Instalar DNS-RECURSIVO-ANYCAST" \
+            "17" "Status dos Servicos" \
+            "18" "Reiniciar Servico" \
+            "19" "Sair" \
             3>&1 1>&2 2>&3)
 
         exitstatus=$?
@@ -1686,9 +2353,10 @@ menu() {
             13) fn_snmpwalk ;;
             14) fn_proxmox_zabbix ;;
             15) fn_teste_dns ;;
-            16) fn_status_servicos ;;
-            17) fn_reiniciar_servico ;;
-            18) exit 0 ;;
+            16) fn_anycast ;;
+            17) fn_status_servicos ;;
+            18) fn_reiniciar_servico ;;
+            19) exit 0 ;;
         esac
     done
 }
