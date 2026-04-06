@@ -2155,13 +2155,11 @@ PidFile=/var/run/zabbix/zabbix_agent2.pid
 LogFile=/var/log/zabbix/zabbix_agent2.log
 LogFileSize=0
 Server=${zabbix_server_ip}
-ServerActive=${zabbix_server_ip}
 Hostname=${sys_hostname}
 Include=/etc/zabbix/zabbix_agent2.d/*.conf
 EOF
     else
         sed -i "s/^Server=.*/Server=${zabbix_server_ip}/" "$conf"
-        sed -i "s/^ServerActive=.*/ServerActive=${zabbix_server_ip}/" "$conf"
         sed -i "s/^Hostname=.*/Hostname=${sys_hostname}/" "$conf"
     fi
 
@@ -2328,7 +2326,7 @@ menu() {
             "13" "SNMPwalk" \
             "14" "Proxmox - Usuario e Zabbix-Agent2" \
             "15" "Teste DNS Unbound (IPv4 e IPv6)" \
-            "16" "Instalar DNS-RECURSIVO-ANYCAST" \
+            "16" "DNS-RECURSIVO-ANYCAST" \
             "17" "Status dos Servicos" \
             "18" "Reiniciar Servico" \
             "19" "Sair" \
