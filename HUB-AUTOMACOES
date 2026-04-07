@@ -2324,11 +2324,11 @@ menu() {
             "11" "Verificar Requisitos da Maquina" \
             "12" "Captura de Pacotes (tcpdump)" \
             "13" "SNMPwalk" \
-            "14" "Proxmox - Usuario e Zabbix-Agent2" \
+            "14" "Configurar Ssuario e Zabbix-Agent2 no PROXMOX" \
             "15" "Teste DNS Unbound (IPv4 e IPv6)" \
-            "16" "DNS-RECURSIVO-ANYCAST" \
-            "17" "Status dos Servicos" \
-            "18" "Reiniciar Servico" \
+            "16" "Instalar DNS Recursivo Anycast" \
+            "17" "Verificar Status dos Servicos" \
+            "18" "Verificiar e Reiniciar Servicos" \
             "19" "Sair" \
             3>&1 1>&2 2>&3)
 
