@@ -627,7 +627,28 @@ preparar_zabbix() {
         return 0
     fi
 
-    apt install zabbix-agent2 -y
+    if ! apt-cache show zabbix-agent2 &>/dev/null; then
+        apt install -y lsb-release 2>/dev/null || true
+        local debian_ver
+        debian_ver=$(cut -d. -f1 /etc/debian_version)
+
+        wget -q "https://repo.zabbix.com/zabbix/7.0/debian/pool/main/z/zabbix-release/zabbix-release_7.0-2+debian${debian_ver}_all.deb" \
+            -O /tmp/zabbix-release.deb
+
+        if [[ $? -ne 0 || ! -s /tmp/zabbix-release.deb ]]; then
+            whiptail --title "Erro" --msgbox "Falha ao baixar o repositorio Zabbix. Verifique a conectividade." 8 60
+            return 1
+        fi
+
+        dpkg -i /tmp/zabbix-release.deb
+        apt update -o Dir::Etc::sourcelist="sources.list.d/zabbix.list" \
+                   -o Dir::Etc::sourcelistparts="-" \
+                   -o APT::Get::List-Cleanup="0" 2>/dev/null || apt update
+    fi
+
+    DEBIAN_FRONTEND=noninteractive apt install -y \
+        -o Dpkg::Options::="--force-confold" \
+        zabbix-agent2
 }
 
 fn_zabbix_comum() {
@@ -1445,13 +1466,14 @@ fn_proxmox_zabbix() {
     senha=$(tr -dc 'A-Za-z0-9!@#$%&*' < /dev/urandom | head -c 16)
 
     pveum useradd zabbix@${realm} -comment "Zabbix monitoring user" 2>/dev/null
-    echo "${senha}" | pveum passwd zabbix@${realm} --password-stdin 2>/dev/null
 
-    if [[ $? -ne 0 ]]; then
-        pveum passwd zabbix@${realm} <<EOF
+    pveum passwd zabbix@${realm} <<EOF
 ${senha}
 ${senha}
 EOF
+
+    if [[ $? -ne 0 ]]; then
+        whiptail --title "Erro" --msgbox "Falha ao definir a senha do usuario zabbix@${realm}.\nDefina manualmente com: pveum passwd zabbix@${realm}" 10 60
     fi
 
     pveum aclmod / --user zabbix@${realm} --role PVEAuditor
@@ -1693,7 +1715,7 @@ fn_iptables_anycast() {
     done
 
     local blocos_acl=()
-    [[ $acl_redes_internas -eq 0 ]] && blocos_acl+=("127.0.0.0/8" "100.64.0.0/10" "10.0.0.0/8" "172.16.0.0/16")
+    [[ $acl_redes_internas -eq 0 ]] && blocos_acl+=("127.0.0.0/8" "100.64.0.0/10" "10.0.0.0/8" "172.16.0.0/16" "192.168.0.0/16")
     for b in "${acl_blocks[@]}"; do blocos_acl+=("$b"); done
 
     if [[ ${#blocos_acl[@]} -gt 0 ]]; then
@@ -1864,7 +1886,7 @@ fn_coletar_dados_anycast() {
     [[ $? -ne 0 || -z "$hostname_frr" ]] && return 1
 
     router_id=$(whiptail --title "FRR - Router ID" \
-        --inputbox "Router ID do OSPF\n(ex: 177.137.208.82 - geralmente o IP publico principal):" 10 65 \
+        --inputbox "Router ID do OSPF\n(ex: 203.0.113.1 - geralmente o IP publico principal):" 10 65 \
         3>&1 1>&2 2>&3)
     [[ $? -ne 0 || -z "$router_id" ]] && return 1
 
@@ -1914,7 +1936,7 @@ fn_coletar_dados_anycast() {
     fi
 
     outgoing_ipv6=$(whiptail --title "Unbound - Outgoing IPv6" \
-        --inputbox "IP de saida IPv6 (outgoing-interface)\n(ex: 2804:978:99::1 | deixe vazio para ignorar):" 10 65 \
+        --inputbox "IP de saida IPv6 (outgoing-interface)\n(ex: 2001:db8::1 | deixe vazio para ignorar):" 10 65 \
         3>&1 1>&2 2>&3)
     [[ $? -ne 0 ]] && outgoing_ipv6=""
 
@@ -1922,12 +1944,12 @@ fn_coletar_dados_anycast() {
     declare -g acl_redes_internas=0
 
     whiptail --title "Unbound - ACL Redes Internas" \
-        --yesno "Deseja liberar automaticamente as redes privadas internas?\n\n  127.0.0.0/8\n  100.64.0.0/10\n  10.0.0.0/8\n  172.16.0.0/16" 14 60
+        --yesno "Deseja liberar automaticamente as redes privadas internas?\n\n  127.0.0.0/8\n  100.64.0.0/10\n  10.0.0.0/8\n  172.16.0.0/16\n  192.168.0.0/16" 16 60
     acl_redes_internas=$?
 
     whiptail --title "Unbound - ACL" --msgbox \
 "Informe os blocos CIDR adicionais permitidos para consulta DNS.
-Ex: 177.137.208.0/20, 2804:978::/32
+Ex: 203.0.113.0/24, 2001:db8::/32
 Deixe vazio para finalizar." 10 65
 
     while true; do
@@ -2097,6 +2119,7 @@ fn_configurar_unbound_anycast() {
             echo "access-control: 100.64.0.0/10 allow"
             echo "access-control: 10.0.0.0/8 allow"
             echo "access-control: 172.16.0.0/16 allow"
+            echo "access-control: 192.168.0.0/16 allow"
         fi
         for block in "${acl_blocks[@]}"; do echo "access-control: $block allow"; done
     } > /etc/unbound/acl.conf
