@@ -282,7 +282,22 @@ fn_reverso() {
     if ! systemctl is-active --quiet unbound 2>/dev/null; then
         whiptail --title "Aviso" --msgbox "Unbound nao detectado. Sera executada a instalacao base antes de configurar a zona reversa." 10 60
         confirmar_ips || return
+
         outgoing_ip=""
+        default_gw=$(ip route show default | awk '/default via/ {print $3; exit}')
+
+        mapfile -t all_ipv4s < <(ip -4 addr show | awk '/inet / {print $2}' | cut -d/ -f1 | grep -v '^127\.')
+        if [[ ${#all_ipv4s[@]} -gt 0 ]]; then
+            local pub_opts=()
+            pub_opts+=("" "Nao definir outgoing IPv4")
+            for pub_ip in "${all_ipv4s[@]}"; do pub_opts+=("$pub_ip" ""); done
+            outgoing_ip=$(whiptail --title "Unbound - Outgoing Interface" \
+                --menu "Selecione o IP de saida para queries externas (outgoing-interface):" 18 65 10 \
+                "${pub_opts[@]}" \
+                3>&1 1>&2 2>&3)
+            [[ $? -ne 0 || "$outgoing_ip" == "" ]] && outgoing_ip=""
+        fi
+
         instalar_unbound_base
         detectar_tier
         gerar_config_unbound "$outgoing_ip"
@@ -2313,22 +2328,22 @@ menu() {
             --menu "Selecione uma opcao:" 40 65 19 \
             "1"  "Instalar DNS Unbound Recursivo" \
             "2"  "Instalar DNS Unbound Reverso" \
-            "3"  "Instalar Monitor do Unbound" \
-            "4"  "Instalar Zabbix-Agent2 Padrao" \
-            "5"  "Instalar Zabbix-Agent2 com Monitoramento Unbound" \
-            "6"  "Instalar e configurar iptables" \
-            "7"  "Instalar Krill e Routinator (RPKI)" \
-            "8"  "Configurar Rota Default com Origem Publica" \
-            "9"  "Instalar Servidores de velocidade (Ookla, Nperf e MC)" \
-            "10" "Gerencia de Usuarios" \
-            "11" "Verificar Requisitos da Maquina" \
-            "12" "Captura de Pacotes (tcpdump)" \
-            "13" "SNMPwalk" \
-            "14" "Configurar Usuario e Zabbix-Agent2 no PROXMOX" \
-            "15" "Teste DNS Unbound (IPv4 e IPv6)" \
-            "16" "Instalar DNS Recursivo Anycast" \
+            "3"  "Instalar DNS Recursivo Anycast" \
+            "4"  "Instalar Monitor do Unbound" \
+            "5"  "Teste DNS Unbound (IPv4 e IPv6)" \
+            "6"  "Instalar Krill e Routinator (RPKI)" \
+            "7"  "Instalar Servidores de velocidade (Ookla, Nperf e MC)" \
+            "8"  "Instalar Zabbix-Agent2 Padrao" \
+            "9"  "Instalar Zabbix-Agent2 com Monitoramento Unbound" \
+            "10" "Configurar Usuario e Zabbix-Agent2 no PROXMOX" \
+            "11" "Instalar e configurar iptables" \
+            "12" "Configurar Rota Default com Origem Publica" \
+            "13" "Gerencia de Usuarios" \
+            "14" "Verificar Requisitos da Maquina" \
+            "15" "Captura de Pacotes (tcpdump)" \
+            "16" "SNMPwalk" \
             "17" "Verificar Status dos Servicos" \
-            "18" "Verificiar e Reiniciar Servicos" \
+            "18" "Verificar e Reiniciar Servicos" \
             "19" "Sair" \
             3>&1 1>&2 2>&3)
 
@@ -2338,20 +2353,20 @@ menu() {
         case "$choice" in
             1)  fn_instalar_recursivo ;;
             2)  fn_reverso ;;
-            3)  fn_monitor_unbound ;;
-            4)  fn_zabbix_comum ;;
-            5)  fn_zabbix_unbound ;;
-            6)  fn_iptables ;;
-            7)  fn_rpki ;;
-            8)  fn_rota_persistente ;;
-            9)  fn_speedtest ;;
-            10) fn_gerencia_usuarios ;;
-            11) fn_requisitos ;;
-            12) fn_tcpdump ;;
-            13) fn_snmpwalk ;;
-            14) fn_proxmox_zabbix ;;
-            15) fn_teste_dns ;;
-            16) fn_anycast ;;
+            3)  fn_anycast ;;
+            4)  fn_monitor_unbound ;;
+            5)  fn_teste_dns ;;
+            6)  fn_rpki ;;
+            7)  fn_speedtest ;;
+            8)  fn_zabbix_comum ;;
+            9)  fn_zabbix_unbound ;;
+            10) fn_proxmox_zabbix ;;
+            11) fn_iptables ;;
+            12) fn_rota_persistente ;;
+            13) fn_gerencia_usuarios ;;
+            14) fn_requisitos ;;
+            15) fn_tcpdump ;;
+            16) fn_snmpwalk ;;
             17) fn_status_servicos ;;
             18) fn_reiniciar_servico ;;
             19) exit 0 ;;
