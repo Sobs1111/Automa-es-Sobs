@@ -69,6 +69,28 @@ detectar_tier() {
     esac
 }
 
+fn_coletar_acl() {
+    declare -g -a acl_blocks=()
+    declare -g acl_redes_internas=1
+
+    whiptail --title "Unbound - ACL Redes Internas" \
+        --yesno "Deseja liberar automaticamente as redes privadas internas?\n\n  127.0.0.0/8\n  100.64.0.0/10\n  10.0.0.0/8\n  172.16.0.0/12\n  192.168.0.0/16\n  169.254.0.0/16\n  fc00::/7 (IPv6 ULA)" 20 60
+    acl_redes_internas=$?
+
+    whiptail --title "Unbound - ACL" --msgbox \
+"Informe os blocos CIDR adicionais permitidos para consulta DNS.
+Ex: 203.0.113.0/24, 2001:db8::/32
+Deixe vazio para finalizar." 10 65
+
+    while true; do
+        acl_block=$(whiptail --title "Unbound - ACL" \
+            --inputbox "Bloco permitido (CIDR)\n(deixe vazio para finalizar):" 10 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$acl_block" ]] && break
+        acl_blocks+=("$acl_block")
+    done
+}
+
 instalar_unbound_base() {
     apt install rsyslog ssh net-tools dnsutils unbound -y
 
@@ -78,10 +100,21 @@ instalar_unbound_base() {
 include-toplevel: "/etc/unbound/unbound.conf.d/*.conf"
 EOF
 
-    cat > /etc/unbound/acl.conf <<EOF
-access-control: ::/0 allow
-access-control: 0.0.0.0/0 allow
-EOF
+    {
+        echo "access-control: 127.0.0.0/8 allow"
+        echo "access-control: ::1/128 allow"
+        if [[ "${acl_redes_internas:-1}" -eq 0 ]]; then
+            echo "access-control: 100.64.0.0/10 allow"
+            echo "access-control: 10.0.0.0/8 allow"
+            echo "access-control: 172.16.0.0/12 allow"
+            echo "access-control: 192.168.0.0/16 allow"
+            echo "access-control: 169.254.0.0/16 allow"
+            echo "access-control: fc00::/7 allow"
+        fi
+        for block in "${acl_blocks[@]:-}"; do
+            [[ -n "$block" ]] && echo "access-control: $block allow"
+        done
+    } > /etc/unbound/acl.conf
 
     touch /etc/unbound/blacklist.conf
     touch /etc/unbound/local_zone.conf
@@ -245,6 +278,7 @@ EOF
 
 fn_instalar_recursivo() {
     confirmar_ips || return
+    fn_coletar_acl
 
     outgoing_ip=""
     default_gw=$(ip route show default | awk '/default via/ {print $3; exit}')
@@ -282,6 +316,7 @@ fn_reverso() {
     if ! systemctl is-active --quiet unbound 2>/dev/null; then
         whiptail --title "Aviso" --msgbox "Unbound nao detectado. Sera executada a instalacao base antes de configurar a zona reversa." 10 60
         confirmar_ips || return
+        fn_coletar_acl
 
         outgoing_ip=""
         default_gw=$(ip route show default | awk '/default via/ {print $3; exit}')
@@ -509,27 +544,63 @@ fn_iptables() {
         whiptail --title "iptables - DNS (porta 53)" \
             --yesno "Unbound detectado. Deseja liberar a porta 53?" 8 55
         if [[ $? -eq 0 ]]; then
-            whiptail --title "iptables - DNS (porta 53)" \
-                --yesno "Liberar porta 53 para qualquer origem?" 8 55
-            if [[ $? -eq 0 ]]; then
-                for ipt in iptables ip6tables; do
-                    $ipt -A INPUT -p tcp --dport 53 -j ACCEPT
-                    $ipt -A INPUT -p udp --dport 53 -j ACCEPT
-                done
+            local blocos_dns=()
+            [[ "${acl_redes_internas:-1}" -eq 0 ]] && blocos_dns+=("127.0.0.0/8" "100.64.0.0/10" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "169.254.0.0/16" "fc00::/7")
+            for b in "${acl_blocks[@]:-}"; do [[ -n "$b" ]] && blocos_dns+=("$b"); done
+
+            if [[ ${#blocos_dns[@]} -gt 0 ]]; then
+                local blocos_fmt=""
+                for b in "${blocos_dns[@]}"; do blocos_fmt+="  $b\n"; done
+                whiptail --title "iptables - DNS porta 53" \
+                    --yesno "Os seguintes blocos foram liberados no Unbound:\n\n${blocos_fmt}\nDeseja liberar os mesmos na porta 53 do iptables?" 20 60
+                if [[ $? -eq 0 ]]; then
+                    for block in "${blocos_dns[@]}"; do
+                        if [[ "$block" == *:* ]]; then
+                            ip6tables -A INPUT -p tcp -s "$block" --dport 53 -j ACCEPT
+                            ip6tables -A INPUT -p udp -s "$block" --dport 53 -j ACCEPT
+                        else
+                            iptables -A INPUT -p tcp -s "$block" --dport 53 -j ACCEPT
+                            iptables -A INPUT -p udp -s "$block" --dport 53 -j ACCEPT
+                        fi
+                    done
+                else
+                    while true; do
+                        dns_src=$(whiptail --title "iptables - DNS" \
+                            --inputbox "Origem permitida para porta 53 (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
+                            3>&1 1>&2 2>&3)
+                        [[ $? -ne 0 || -z "$dns_src" ]] && break
+                        if [[ "$dns_src" == *:* ]]; then
+                            ip6tables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
+                            ip6tables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
+                        else
+                            iptables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
+                            iptables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
+                        fi
+                    done
+                fi
             else
-                while true; do
-                    dns_src=$(whiptail --title "iptables - DNS" \
-                        --inputbox "Origem permitida para porta 53 (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
-                        3>&1 1>&2 2>&3)
-                    [[ $? -ne 0 || -z "$dns_src" ]] && break
-                    if [[ "$dns_src" == *:* ]]; then
-                        ip6tables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
-                        ip6tables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
-                    else
-                        iptables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
-                        iptables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
-                    fi
-                done
+                whiptail --title "iptables - DNS (porta 53)" \
+                    --yesno "Liberar porta 53 para qualquer origem?" 8 55
+                if [[ $? -eq 0 ]]; then
+                    for ipt in iptables ip6tables; do
+                        $ipt -A INPUT -p tcp --dport 53 -j ACCEPT
+                        $ipt -A INPUT -p udp --dport 53 -j ACCEPT
+                    done
+                else
+                    while true; do
+                        dns_src=$(whiptail --title "iptables - DNS" \
+                            --inputbox "Origem permitida para porta 53 (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
+                            3>&1 1>&2 2>&3)
+                        [[ $? -ne 0 || -z "$dns_src" ]] && break
+                        if [[ "$dns_src" == *:* ]]; then
+                            ip6tables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
+                            ip6tables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
+                        else
+                            iptables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
+                            iptables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
+                        fi
+                    done
+                fi
             fi
         fi
     fi
@@ -651,6 +722,28 @@ preparar_zabbix() {
         zabbix-agent2
 }
 
+fn_firewall_zabbix() {
+    if systemctl is-active --quiet netfilter-persistent 2>/dev/null || iptables -L INPUT -n 2>/dev/null | grep -q "DROP\|REJECT"; then
+        whiptail --title "iptables Detectado" --yesno "Firewall ativo detectado. Deseja adicionar a origem para liberacao da porta 10050 (Zabbix)?" 8 65
+        if [[ $? -eq 0 ]]; then
+            zabbix_src=$(whiptail --title "iptables - Zabbix" \
+                --inputbox "Origem para porta 10050 do Zabbix (CIDR ou IP):" 10 60 \
+                3>&1 1>&2 2>&3)
+            if [[ $? -eq 0 && -n "$zabbix_src" ]]; then
+                if [[ "$zabbix_src" == *:* ]]; then
+                    ip6tables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
+                    ip6tables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
+                else
+                    iptables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
+                    iptables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
+                fi
+                netfilter-persistent save
+                whiptail --title "Concluido" --msgbox "Regra para porta 10050 adicionada e salva." 8 50
+            fi
+        fi
+    fi
+}
+
 fn_zabbix_comum() {
     preparar_zabbix
     sys_hostname=$(hostname)
@@ -664,7 +757,6 @@ PidFile=/var/run/zabbix/zabbix_agent2.pid
 LogFile=/var/log/zabbix/zabbix_agent2.log
 LogFileSize=0
 Server=0.0.0.0/0
-ServerActive=127.0.0.1
 Hostname=${sys_hostname}
 Include=/etc/zabbix/zabbix_agent2.d/*.conf
 EOF
@@ -677,20 +769,7 @@ EOF
     systemctl restart zabbix-agent2
     whiptail --title "Concluido" --msgbox "Zabbix Agent2 configurado.\nHostname: ${sys_hostname}" 8 60
 
-    if systemctl is-active --quiet netfilter-persistent 2>/dev/null || iptables -L INPUT -n 2>/dev/null | grep -q "DROP\|REJECT"; then
-        whiptail --title "iptables Detectado" --yesno "Firewall ativo detectado. Deseja adicionar a origem para liberacao da porta 10050 (Zabbix)?" 8 65
-        if [[ $? -eq 0 ]]; then
-            zabbix_src=$(whiptail --title "iptables - Zabbix" \
-                --inputbox "Origem para porta 10050 do Zabbix (CIDR ou IP):" 10 60 \
-                3>&1 1>&2 2>&3)
-            if [[ $? -eq 0 && -n "$zabbix_src" ]]; then
-                iptables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
-                iptables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
-                netfilter-persistent save
-                whiptail --title "Concluido" --msgbox "Regra para porta 10050 adicionada e salva." 8 50
-            fi
-        fi
-    fi
+    fn_firewall_zabbix
 }
 
 fn_zabbix_unbound() {
@@ -1497,7 +1576,6 @@ PidFile=/var/run/zabbix/zabbix_agent2.pid
 LogFile=/var/log/zabbix/zabbix_agent2.log
 LogFileSize=0
 Server=0.0.0.0/0
-ServerActive=127.0.0.1
 Hostname=${sys_hostname}
 Include=/etc/zabbix/zabbix_agent2.d/*.conf
 EOF
@@ -1513,6 +1591,8 @@ EOF
 "Zabbix Agent2 instalado e configurado.\n
   Hostname : ${sys_hostname}
   Server   : 0.0.0.0/0" 12 55
+
+    fn_firewall_zabbix
 }
 
 fn_teste_dns() {
@@ -1715,7 +1795,7 @@ fn_iptables_anycast() {
     done
 
     local blocos_acl=()
-    [[ $acl_redes_internas -eq 0 ]] && blocos_acl+=("127.0.0.0/8" "100.64.0.0/10" "10.0.0.0/8" "172.16.0.0/16" "192.168.0.0/16")
+    [[ $acl_redes_internas -eq 0 ]] && blocos_acl+=("127.0.0.0/8" "100.64.0.0/10" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "169.254.0.0/16" "fc00::/7")
     for b in "${acl_blocks[@]}"; do blocos_acl+=("$b"); done
 
     if [[ ${#blocos_acl[@]} -gt 0 ]]; then
@@ -1944,7 +2024,7 @@ fn_coletar_dados_anycast() {
     declare -g acl_redes_internas=0
 
     whiptail --title "Unbound - ACL Redes Internas" \
-        --yesno "Deseja liberar automaticamente as redes privadas internas?\n\n  127.0.0.0/8\n  100.64.0.0/10\n  10.0.0.0/8\n  172.16.0.0/16\n  192.168.0.0/16" 16 60
+        --yesno "Deseja liberar automaticamente as redes privadas internas?\n\n  127.0.0.0/8\n  100.64.0.0/10\n  10.0.0.0/8\n  172.16.0.0/12\n  192.168.0.0/16\n  169.254.0.0/16\n  fc00::/7 (IPv6 ULA)" 20 60
     acl_redes_internas=$?
 
     whiptail --title "Unbound - ACL" --msgbox \
@@ -2118,8 +2198,10 @@ fn_configurar_unbound_anycast() {
         if [[ $acl_redes_internas -eq 0 ]]; then
             echo "access-control: 100.64.0.0/10 allow"
             echo "access-control: 10.0.0.0/8 allow"
-            echo "access-control: 172.16.0.0/16 allow"
+            echo "access-control: 172.16.0.0/12 allow"
             echo "access-control: 192.168.0.0/16 allow"
+            echo "access-control: 169.254.0.0/16 allow"
+            echo "access-control: fc00::/7 allow"
         fi
         for block in "${acl_blocks[@]}"; do echo "access-control: $block allow"; done
     } > /etc/unbound/acl.conf
