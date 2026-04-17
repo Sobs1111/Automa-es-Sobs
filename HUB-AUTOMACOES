@@ -2442,9 +2442,18 @@ fn_verificar_bloqueio() {
         break
     done
 
+    whiptail --title "Verificar Bloqueio DNS" \
+        --yesno "Deseja ver todos os dominios relacionados\nque contenham \"$dominio\"?" 9 60
+    local busca_ampla=$?
+
     local resultado_grep resultado_dig bloqueado_grep=0 bloqueado_dig=0
 
-    resultado_grep=$(grep -rF "\"${dominio}" /etc/unbound/ 2>/dev/null)
+    if [[ $busca_ampla -eq 0 ]]; then
+        resultado_grep=$(grep -rF "${dominio}" /etc/unbound/ 2>/dev/null)
+    else
+        resultado_grep=$(grep -rF "\"${dominio}" /etc/unbound/ 2>/dev/null)
+    fi
+
     if echo "$resultado_grep" | grep -q "127.0.0.1\|::\b"; then
         bloqueado_grep=1
     fi
@@ -2452,6 +2461,52 @@ fn_verificar_bloqueio() {
     resultado_dig=$(dig @127.0.0.1 "$dominio" A +time=3 +tries=1 2>/dev/null)
     if echo "$resultado_dig" | grep -qP "^\S+\s+\d+\s+IN\s+A\s+127\.0\.0\.1"; then
         bloqueado_dig=1
+    fi
+
+    if [[ $busca_ampla -eq 0 ]]; then
+        local dominios_lista secao_config msg_titulo
+        msg_titulo="Dominios relacionados a: $dominio"
+
+        dominios_lista=$(echo "$resultado_grep" | grep "local-zone:" | grep -oP '(?<=")[^"]+(?=")' | sort -u)
+
+        if [[ -z "$dominios_lista" ]]; then
+            secao_config="  (nenhum dominio relacionado encontrado)"
+        else
+            secao_config=""
+            while IFS= read -r d; do
+                local z i4 i6
+                z=$(echo "$resultado_grep"  | grep "local-zone:"  | grep "\"$d\""  | awk '{print $NF}' | head -1)
+                i4=$(echo "$resultado_grep" | grep "local-data:"  | grep "\"$d "   | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
+                i6=$(echo "$resultado_grep" | grep "AAAA"         | grep "\"$d "   | grep -oP '(?<=AAAA )[^"]+' | head -1)
+                local linha="  $d"
+                [[ -n "$z"  ]] && linha+="  [${z}]"
+                [[ -n "$i4" ]] && linha+="  A:${i4}"
+                [[ -n "$i6" ]] && linha+="  AAAA:${i6}"
+                secao_config+="$linha\n"
+            done <<< "$dominios_lista"
+        fi
+
+        local total
+        total=$(echo "$dominios_lista" | grep -c .)
+
+        clear
+        echo "======================================================"
+        echo " Busca por: $dominio"
+        echo " Total    : $total dominio(s) encontrado(s)"
+        echo "======================================================"
+        echo ""
+        printf "  %-45s %-12s %-15s %s\n" "DOMINIO" "ZONA" "IPv4" "IPv6"
+        echo "  ----------------------------------------------------------------------------"
+        while IFS= read -r d; do
+            local z i4 i6
+            z=$(echo "$resultado_grep"  | grep "local-zone:" | grep "\"$d\""  | awk '{print $NF}' | head -1)
+            i4=$(echo "$resultado_grep" | grep "local-data:" | grep "\"$d "   | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
+            i6=$(echo "$resultado_grep" | grep "AAAA"        | grep "\"$d "   | grep -oP '(?<=AAAA )[^"]+' | head -1)
+            printf "  %-45s %-12s %-15s %s\n" "$d" "${z:--}" "${i4:--}" "${i6:--}"
+        done <<< "$dominios_lista"
+        echo ""
+        read -rp "Pressione Enter para voltar ao menu..."
+        return 0
     fi
 
     if [[ $bloqueado_grep -eq 1 && $bloqueado_dig -eq 1 ]]; then
