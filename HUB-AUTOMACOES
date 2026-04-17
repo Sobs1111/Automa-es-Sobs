@@ -2467,7 +2467,7 @@ fn_verificar_bloqueio() {
     local secao_config
     if [[ -n "$resultado_grep" ]]; then
         local zone_type ipv4_addr ipv6_addr
-        zone_type=$(echo "$resultado_grep" | grep -oP '(?<=local-zone: "[^"]*" )\S+' | sort -u | head -1)
+        zone_type=$(echo "$resultado_grep" | grep "local-zone:" | awk '{print $NF}' | sort -u | head -1)
         ipv4_addr=$(echo "$resultado_grep" | grep "local-data:" | grep -oP '\d+\.\d+\.\d+\.\d+' | sort -u | head -1)
         ipv6_addr=$(echo "$resultado_grep" | grep "AAAA" | grep -oP '(?<=AAAA )[^"]+' | sort -u | head -1)
         secao_config=""
