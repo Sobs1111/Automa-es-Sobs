@@ -2466,7 +2466,7 @@ fn_verificar_bloqueio() {
 
     local secao_config
     if [[ -n "$resultado_grep" ]]; then
-        secao_config=$(echo "$resultado_grep" | sed 's|[^:]*:||' | sed 's/^/  /')
+        secao_config=$(echo "$resultado_grep" | sed 's|[^:]*:||' | sort -u | sed 's/^/  /')
     else
         secao_config="  (nenhuma entrada encontrada)"
     fi
