@@ -2443,7 +2443,6 @@ fn_verificar_bloqueio() {
     done
 
     local resultado_grep resultado_dig bloqueado_grep=0 bloqueado_dig=0
-    local evidencia=""
 
     resultado_grep=$(grep -r "$dominio" /etc/unbound/ 2>/dev/null)
     if echo "$resultado_grep" | grep -q "127.0.0.1\|::\b"; then
@@ -2457,24 +2456,43 @@ fn_verificar_bloqueio() {
 
     if [[ $bloqueado_grep -eq 1 && $bloqueado_dig -eq 1 ]]; then
         status="BLOQUEADO"
-        evidencia="Configuracao no Unbound:\n$resultado_grep\n\nResposta do DNS:\n$resultado_dig"
     elif [[ $bloqueado_grep -eq 1 ]]; then
-        status="BLOQUEADO (apenas na config, dig nao confirmou)"
-        evidencia="Configuracao no Unbound:\n$resultado_grep\n\nResposta do DNS:\n$resultado_dig"
+        status="BLOQUEADO (config sem confirmacao do dig)"
     elif [[ $bloqueado_dig -eq 1 ]]; then
-        status="BLOQUEADO (dig aponta 127.0.0.1, mas nao encontrado na config)"
-        evidencia="Configuracao no Unbound: nao encontrado\n\nResposta do DNS:\n$resultado_dig"
+        status="BLOQUEADO (dig confirma, sem entrada na config)"
     else
         status="NAO BLOQUEADO"
-        if [[ -n "$resultado_grep" ]]; then
-            evidencia="Config encontrada (sem redirecionamento para 127.0.0.1):\n$resultado_grep\n\nResposta do DNS:\n$resultado_dig"
-        else
-            evidencia="Nao encontrado na config do Unbound.\n\nResposta do DNS:\n$resultado_dig"
-        fi
     fi
 
-    whiptail --title "Resultado: $dominio" \
-        --msgbox "Status: $status\n\n--- EVIDENCIA ---\n$evidencia" 30 78
+    local secao_config
+    if [[ -n "$resultado_grep" ]]; then
+        secao_config=$(echo "$resultado_grep" | sed 's|[^:]*:||' | sed 's/^/  /')
+    else
+        secao_config="  (nenhuma entrada encontrada)"
+    fi
+
+    local secao_dig
+    secao_dig=$(echo "$resultado_dig" | awk '
+        /^;; ANSWER SECTION:/ { found=1; next }
+        found && /^;;/        { found=0 }
+        found && NF           { print "  " $0 }
+    ')
+    [[ -z "$secao_dig" ]] && secao_dig="  (sem resposta na ANSWER SECTION)"
+
+    local msg
+    msg="Dominio : $dominio
+Status  : $status
+
+--- Config Unbound (/etc/unbound/) ---
+
+$secao_config
+
+--- Resposta DNS (dig @127.0.0.1 $dominio A) ---
+
+$secao_dig"
+
+    whiptail --title "Verificar Bloqueio: $dominio" \
+        --msgbox "$msg" 26 72
 }
 
 menu() {
