@@ -2559,23 +2559,22 @@ $secao_dig"
 }
 
 _benchmark_ioping_verdict() {
-    local avg_raw avg_num avg_unit avg_ms
+    local avg_raw avg_num avg_unit avg_us verdict
     avg_raw=$(echo "$1" | grep "min/avg/max/mdev" | sed 's/.*=\s*//' | awk -F'/' '{print $2}' | xargs)
     avg_num=$(echo "$avg_raw" | awk '{print $1}')
     avg_unit=$(echo "$avg_raw" | awk '{print $2}')
 
     case "$avg_unit" in
-        us) avg_ms=$(awk "BEGIN {printf \"%.3f\", $avg_num / 1000}") ;;
-        ms) avg_ms=$avg_num ;;
-        s)  avg_ms=$(awk "BEGIN {printf \"%.3f\", $avg_num * 1000}") ;;
-        *)  avg_ms=0 ;;
+        us) avg_us=$(printf "%.0f" "$avg_num") ;;
+        ms) avg_us=$(printf "%.0f" "$(echo "$avg_num * 1000" | bc)") ;;
+        s)  avg_us=$(printf "%.0f" "$(echo "$avg_num * 1000000" | bc)") ;;
+        *)  avg_us=999999 ;;
     esac
 
-    local verdict
-    if   awk "BEGIN {exit !($avg_ms < 1)}";  then verdict="Excelente  - latencia muito baixa (tipico de SSD NVMe)"
-    elif awk "BEGIN {exit !($avg_ms < 5)}";  then verdict="Bom        - latencia adequada (SSD SATA ou NVMe virtualizado)"
-    elif awk "BEGIN {exit !($avg_ms < 20)}"; then verdict="Regular    - latencia moderada (HDD ou storage virtualizado)"
-    else                                          verdict="Ruim       - latencia alta, verificar I/O do storage"
+    if   (( avg_us < 1000  )); then verdict="Excelente  - latencia muito baixa (tipico de SSD NVMe)"
+    elif (( avg_us < 5000  )); then verdict="Bom        - latencia adequada (SSD SATA ou NVMe virtualizado)"
+    elif (( avg_us < 20000 )); then verdict="Regular    - latencia moderada (HDD ou storage virtualizado)"
+    else                            verdict="Ruim       - latencia alta, verificar I/O do storage"
     fi
 
     echo "  Latencia media : ${avg_raw:-n/a}"
@@ -2583,18 +2582,19 @@ _benchmark_ioping_verdict() {
 }
 
 _benchmark_fio_verdict() {
-    local read_bw write_bw read_iops write_iops verdict
+    local read_bw write_bw read_iops write_iops ref_int verdict
 
-    read_bw=$(echo  "$1" | grep -i "read:"  | grep -oP 'BW=\K[\d.]+(?=MiB)' | head -1)
-    write_bw=$(echo "$1" | grep -i "write:" | grep -oP 'BW=\K[\d.]+(?=MiB)' | head -1)
-    read_iops=$(echo  "$1" | grep -i "read:"  | grep -oP 'IOPS=\K[\w.]+' | head -1)
+    read_bw=$(echo   "$1" | grep -i "read:"  | grep -oP 'BW=\K[\d.]+(?=MiB)' | head -1)
+    write_bw=$(echo  "$1" | grep -i "write:" | grep -oP 'BW=\K[\d.]+(?=MiB)' | head -1)
+    read_iops=$(echo "$1" | grep -i "read:"  | grep -oP 'IOPS=\K[\w.]+' | head -1)
     write_iops=$(echo "$1" | grep -i "write:" | grep -oP 'IOPS=\K[\w.]+' | head -1)
 
-    local ref="${read_bw:-0}"
-    if   awk "BEGIN {exit !($ref > 500)}"; then verdict="Excelente  - throughput alto (NVMe ou storage de alta performance)"
-    elif awk "BEGIN {exit !($ref > 200)}"; then verdict="Bom        - throughput adequado (SSD SATA ou NVMe virtualizado)"
-    elif awk "BEGIN {exit !($ref > 50)}";  then verdict="Regular    - throughput moderado (HDD rapido ou storage compartilhado)"
-    else                                        verdict="Ruim       - throughput baixo, verificar storage"
+    ref_int=$(printf "%.0f" "${read_bw:-0}" 2>/dev/null || echo 0)
+
+    if   (( ref_int > 500 )); then verdict="Excelente  - throughput alto (NVMe ou storage de alta performance)"
+    elif (( ref_int > 200 )); then verdict="Bom        - throughput adequado (SSD SATA ou NVMe virtualizado)"
+    elif (( ref_int > 50  )); then verdict="Regular    - throughput moderado (HDD rapido ou storage compartilhado)"
+    else                           verdict="Ruim       - throughput baixo, verificar storage"
     fi
 
     echo "  Leitura  : ${read_bw:-n/a} MiB/s  |  IOPS: ${read_iops:-n/a}"
@@ -2613,6 +2613,8 @@ fn_benchmark_disco() {
     [[ $? -ne 0 ]] && return 1
 
     clear
+    local tmp
+    tmp=$(mktemp)
 
     if [[ "$ferramenta" == "1" || "$ferramenta" == "3" ]]; then
         which ioping &>/dev/null || apt-get install -y ioping
@@ -2621,14 +2623,12 @@ fn_benchmark_disco() {
         echo "======================================================"
         echo ""
         echo ">>> Leitura (8k x 10 amostras)"
-        local ioping_read
-        ioping_read=$(ioping -c 10 -s 8k . 2>&1)
-        echo "$ioping_read"
+        ioping -c 10 -s 8k . 2>&1 | tee "$tmp"
+        local ioping_read; ioping_read=$(cat "$tmp")
         echo ""
         echo ">>> Escrita (8k x 10 amostras)"
-        local ioping_write
-        ioping_write=$(ioping -c 10 -s 8k -W . 2>&1)
-        echo "$ioping_write"
+        ioping -c 10 -s 8k -W . 2>&1 | tee "$tmp"
+        local ioping_write; ioping_write=$(cat "$tmp")
         echo ""
         echo "------------------------------------------------------"
         echo " RESULTADO ioping"
@@ -2648,12 +2648,11 @@ fn_benchmark_disco() {
         echo " 4 jobs | blocos 128k | arquivo 1G | duracao 1 min"
         echo "======================================================"
         echo ""
-        local fio_out
-        fio_out=$(fio --name=benchmark --filename=/tmp/fio_iotest \
+        fio --name=benchmark --filename=/tmp/fio_iotest \
             --rw=readwrite --ioengine=libaio --bs=128k \
             --numjobs=4 --size=1G --runtime=1m \
-            --time_based --direct=1 2>&1)
-        echo "$fio_out"
+            --time_based --direct=1 2>&1 | tee "$tmp"
+        local fio_out; fio_out=$(cat "$tmp")
         rm -f /tmp/fio_iotest
         echo ""
         echo "------------------------------------------------------"
@@ -2663,6 +2662,7 @@ fn_benchmark_disco() {
         echo ""
     fi
 
+    rm -f "$tmp"
     read -rp "Pressione Enter para voltar ao menu..."
 }
 
