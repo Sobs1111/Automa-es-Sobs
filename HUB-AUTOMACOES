@@ -2558,6 +2558,50 @@ $secao_dig"
         --msgbox "$msg" 26 72
 }
 
+_benchmark_ioping_verdict() {
+    local avg_raw avg_num avg_unit avg_ms
+    avg_raw=$(echo "$1" | grep "min/avg/max/mdev" | sed 's/.*=\s*//' | awk -F'/' '{print $2}' | xargs)
+    avg_num=$(echo "$avg_raw" | awk '{print $1}')
+    avg_unit=$(echo "$avg_raw" | awk '{print $2}')
+
+    case "$avg_unit" in
+        us) avg_ms=$(awk "BEGIN {printf \"%.3f\", $avg_num / 1000}") ;;
+        ms) avg_ms=$avg_num ;;
+        s)  avg_ms=$(awk "BEGIN {printf \"%.3f\", $avg_num * 1000}") ;;
+        *)  avg_ms=0 ;;
+    esac
+
+    local verdict
+    if   awk "BEGIN {exit !($avg_ms < 1)}";  then verdict="Excelente  - latencia muito baixa (tipico de SSD NVMe)"
+    elif awk "BEGIN {exit !($avg_ms < 5)}";  then verdict="Bom        - latencia adequada (SSD SATA ou NVMe virtualizado)"
+    elif awk "BEGIN {exit !($avg_ms < 20)}"; then verdict="Regular    - latencia moderada (HDD ou storage virtualizado)"
+    else                                          verdict="Ruim       - latencia alta, verificar I/O do storage"
+    fi
+
+    echo "  Latencia media : ${avg_raw:-n/a}"
+    echo "  Avaliacao      : $verdict"
+}
+
+_benchmark_fio_verdict() {
+    local read_bw write_bw read_iops write_iops verdict
+
+    read_bw=$(echo  "$1" | grep -i "read:"  | grep -oP 'BW=\K[\d.]+(?=MiB)' | head -1)
+    write_bw=$(echo "$1" | grep -i "write:" | grep -oP 'BW=\K[\d.]+(?=MiB)' | head -1)
+    read_iops=$(echo  "$1" | grep -i "read:"  | grep -oP 'IOPS=\K[\w.]+' | head -1)
+    write_iops=$(echo "$1" | grep -i "write:" | grep -oP 'IOPS=\K[\w.]+' | head -1)
+
+    local ref="${read_bw:-0}"
+    if   awk "BEGIN {exit !($ref > 500)}"; then verdict="Excelente  - throughput alto (NVMe ou storage de alta performance)"
+    elif awk "BEGIN {exit !($ref > 200)}"; then verdict="Bom        - throughput adequado (SSD SATA ou NVMe virtualizado)"
+    elif awk "BEGIN {exit !($ref > 50)}";  then verdict="Regular    - throughput moderado (HDD rapido ou storage compartilhado)"
+    else                                        verdict="Ruim       - throughput baixo, verificar storage"
+    fi
+
+    echo "  Leitura  : ${read_bw:-n/a} MiB/s  |  IOPS: ${read_iops:-n/a}"
+    echo "  Escrita  : ${write_bw:-n/a} MiB/s  |  IOPS: ${write_iops:-n/a}"
+    echo "  Avaliacao: $verdict"
+}
+
 fn_benchmark_disco() {
     local ferramenta
     ferramenta=$(whiptail --title "Benchmark de Disco" \
@@ -2577,10 +2621,23 @@ fn_benchmark_disco() {
         echo "======================================================"
         echo ""
         echo ">>> Leitura (8k x 10 amostras)"
-        ioping -c 10 -s 8k .
+        local ioping_read
+        ioping_read=$(ioping -c 10 -s 8k . 2>&1)
+        echo "$ioping_read"
         echo ""
         echo ">>> Escrita (8k x 10 amostras)"
-        ioping -c 10 -s 8k -W .
+        local ioping_write
+        ioping_write=$(ioping -c 10 -s 8k -W . 2>&1)
+        echo "$ioping_write"
+        echo ""
+        echo "------------------------------------------------------"
+        echo " RESULTADO ioping"
+        echo "------------------------------------------------------"
+        echo " Leitura:"
+        _benchmark_ioping_verdict "$ioping_read"
+        echo ""
+        echo " Escrita:"
+        _benchmark_ioping_verdict "$ioping_write"
         echo ""
     fi
 
@@ -2591,11 +2648,18 @@ fn_benchmark_disco() {
         echo " 4 jobs | blocos 128k | arquivo 1G | duracao 1 min"
         echo "======================================================"
         echo ""
-        fio --name=benchmark --filename=/tmp/fio_iotest \
+        local fio_out
+        fio_out=$(fio --name=benchmark --filename=/tmp/fio_iotest \
             --rw=readwrite --ioengine=libaio --bs=128k \
             --numjobs=4 --size=1G --runtime=1m \
-            --time_based --direct=1
+            --time_based --direct=1 2>&1)
+        echo "$fio_out"
         rm -f /tmp/fio_iotest
+        echo ""
+        echo "------------------------------------------------------"
+        echo " RESULTADO fio"
+        echo "------------------------------------------------------"
+        _benchmark_fio_verdict "$fio_out"
         echo ""
     fi
 
