@@ -2651,9 +2651,9 @@ fn_benchmark_disco() {
         fio --name=benchmark --filename=/tmp/fio_iotest \
             --rw=readwrite --ioengine=libaio --bs=128k \
             --numjobs=4 --size=1G --runtime=1m \
-            --time_based --direct=1 2>&1 | tee "$tmp"
-        local fio_out; fio_out=$(cat "$tmp")
-        rm -f /tmp/fio_iotest
+            --time_based --direct=1 --output=/tmp/fio_result.txt
+        local fio_out; fio_out=$(cat /tmp/fio_result.txt 2>/dev/null)
+        rm -f /tmp/fio_iotest /tmp/fio_result.txt
         echo ""
         echo "------------------------------------------------------"
         echo " RESULTADO fio"
