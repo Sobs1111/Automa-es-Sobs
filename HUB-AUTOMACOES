@@ -2558,10 +2558,54 @@ $secao_dig"
         --msgbox "$msg" 26 72
 }
 
+fn_benchmark_disco() {
+    local ferramenta
+    ferramenta=$(whiptail --title "Benchmark de Disco" \
+        --menu "Selecione o tipo de teste:" 14 65 3 \
+        "1" "ioping  - Teste de latencia de disco" \
+        "2" "fio     - Teste de leitura e escrita em disco" \
+        "3" "Ambos" \
+        3>&1 1>&2 2>&3)
+    [[ $? -ne 0 ]] && return 1
+
+    clear
+
+    if [[ "$ferramenta" == "1" || "$ferramenta" == "3" ]]; then
+        which ioping &>/dev/null || apt-get install -y ioping
+        echo "======================================================"
+        echo " ioping - Teste de Latencia de Disco"
+        echo "======================================================"
+        echo ""
+        echo ">>> Leitura (8k x 10 amostras)"
+        ioping -c 10 -s 8k .
+        echo ""
+        echo ">>> Escrita (8k x 10 amostras)"
+        ioping -c 10 -s 8k -W .
+        echo ""
+    fi
+
+    if [[ "$ferramenta" == "2" || "$ferramenta" == "3" ]]; then
+        which fio &>/dev/null || apt-get install -y fio
+        echo "======================================================"
+        echo " fio - Teste de Leitura e Escrita em Disco"
+        echo " 4 jobs | blocos 128k | arquivo 1G | duracao 1 min"
+        echo "======================================================"
+        echo ""
+        fio --name=benchmark --filename=/tmp/fio_iotest \
+            --rw=readwrite --ioengine=libaio --bs=128k \
+            --numjobs=4 --size=1G --runtime=1m \
+            --time_based --direct=1
+        rm -f /tmp/fio_iotest
+        echo ""
+    fi
+
+    read -rp "Pressione Enter para voltar ao menu..."
+}
+
 menu() {
     while true; do
         choice=$(whiptail --title "Hub de Configuracoes" \
-            --menu "Selecione uma opcao:" 40 65 20 \
+            --menu "Selecione uma opcao:" 40 65 21 \
             "1"  "Instalar DNS Unbound Recursivo" \
             "2"  "Instalar DNS Unbound Reverso" \
             "3"  "Instalar DNS Recursivo Anycast" \
@@ -2581,7 +2625,8 @@ menu() {
             "17" "Verificar Status dos Servicos" \
             "18" "Verificar e Reiniciar Servicos" \
             "19" "Verificar Bloqueio de Dominio" \
-            "20" "Sair" \
+            "20" "Benchmark de Disco (ioping / fio)" \
+            "21" "Sair" \
             3>&1 1>&2 2>&3)
 
         exitstatus=$?
@@ -2607,7 +2652,8 @@ menu() {
             17) fn_status_servicos ;;
             18) fn_reiniciar_servico ;;
             19) fn_verificar_bloqueio ;;
-            20) exit 0 ;;
+            20) fn_benchmark_disco ;;
+            21) exit 0 ;;
         esac
     done
 }
