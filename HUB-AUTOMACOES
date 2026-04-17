@@ -2427,10 +2427,60 @@ Verifique o OSPF com:
 Pode levar ate 2 minutos para fechar apos reiniciar." 14 60
 }
 
+fn_verificar_bloqueio() {
+    which dig &>/dev/null || apt-get install -y dnsutils
+
+    while true; do
+        dominio=$(whiptail --title "Verificar Bloqueio DNS" \
+            --inputbox "Informe o dominio a verificar:\n(ex: facebook.com)" 10 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && return 1
+        [[ -z "$dominio" ]] && {
+            whiptail --title "Erro" --msgbox "Dominio nao pode ser vazio." 8 40
+            continue
+        }
+        break
+    done
+
+    local resultado_grep resultado_dig bloqueado_grep=0 bloqueado_dig=0
+    local evidencia=""
+
+    resultado_grep=$(grep -r "$dominio" /etc/unbound/ 2>/dev/null)
+    if echo "$resultado_grep" | grep -q "127.0.0.1\|::\b"; then
+        bloqueado_grep=1
+    fi
+
+    resultado_dig=$(dig @127.0.0.1 "$dominio" A +time=3 +tries=1 2>/dev/null)
+    if echo "$resultado_dig" | grep -qP "^\S+\s+\d+\s+IN\s+A\s+127\.0\.0\.1"; then
+        bloqueado_dig=1
+    fi
+
+    if [[ $bloqueado_grep -eq 1 && $bloqueado_dig -eq 1 ]]; then
+        status="BLOQUEADO"
+        evidencia="Configuracao no Unbound:\n$resultado_grep\n\nResposta do DNS:\n$resultado_dig"
+    elif [[ $bloqueado_grep -eq 1 ]]; then
+        status="BLOQUEADO (apenas na config, dig nao confirmou)"
+        evidencia="Configuracao no Unbound:\n$resultado_grep\n\nResposta do DNS:\n$resultado_dig"
+    elif [[ $bloqueado_dig -eq 1 ]]; then
+        status="BLOQUEADO (dig aponta 127.0.0.1, mas nao encontrado na config)"
+        evidencia="Configuracao no Unbound: nao encontrado\n\nResposta do DNS:\n$resultado_dig"
+    else
+        status="NAO BLOQUEADO"
+        if [[ -n "$resultado_grep" ]]; then
+            evidencia="Config encontrada (sem redirecionamento para 127.0.0.1):\n$resultado_grep\n\nResposta do DNS:\n$resultado_dig"
+        else
+            evidencia="Nao encontrado na config do Unbound.\n\nResposta do DNS:\n$resultado_dig"
+        fi
+    fi
+
+    whiptail --title "Resultado: $dominio" \
+        --msgbox "Status: $status\n\n--- EVIDENCIA ---\n$evidencia" 30 78
+}
+
 menu() {
     while true; do
         choice=$(whiptail --title "Hub de Configuracoes" \
-            --menu "Selecione uma opcao:" 40 65 19 \
+            --menu "Selecione uma opcao:" 40 65 20 \
             "1"  "Instalar DNS Unbound Recursivo" \
             "2"  "Instalar DNS Unbound Reverso" \
             "3"  "Instalar DNS Recursivo Anycast" \
@@ -2449,7 +2499,8 @@ menu() {
             "16" "SNMPwalk" \
             "17" "Verificar Status dos Servicos" \
             "18" "Verificar e Reiniciar Servicos" \
-            "19" "Sair" \
+            "19" "Verificar Bloqueio de Dominio" \
+            "20" "Sair" \
             3>&1 1>&2 2>&3)
 
         exitstatus=$?
@@ -2474,7 +2525,8 @@ menu() {
             16) fn_snmpwalk ;;
             17) fn_status_servicos ;;
             18) fn_reiniciar_servico ;;
-            19) exit 0 ;;
+            19) fn_verificar_bloqueio ;;
+            20) exit 0 ;;
         esac
     done
 }
