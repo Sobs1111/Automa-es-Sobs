@@ -2444,7 +2444,7 @@ fn_verificar_bloqueio() {
 
     local resultado_grep resultado_dig bloqueado_grep=0 bloqueado_dig=0
 
-    resultado_grep=$(grep -rF "\"${dominio}\"" /etc/unbound/ 2>/dev/null)
+    resultado_grep=$(grep -rF "\"${dominio}" /etc/unbound/ 2>/dev/null)
     if echo "$resultado_grep" | grep -q "127.0.0.1\|::\b"; then
         bloqueado_grep=1
     fi
