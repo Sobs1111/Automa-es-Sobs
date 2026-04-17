@@ -2466,7 +2466,15 @@ fn_verificar_bloqueio() {
 
     local secao_config
     if [[ -n "$resultado_grep" ]]; then
-        secao_config=$(echo "$resultado_grep" | sed 's|[^:]*:||' | sort -u | sed 's/^/  /')
+        local zone_type ipv4_addr ipv6_addr
+        zone_type=$(echo "$resultado_grep" | grep -oP '(?<=local-zone: "[^"]*" )\S+' | sort -u | head -1)
+        ipv4_addr=$(echo "$resultado_grep" | grep "local-data:" | grep -oP '\d+\.\d+\.\d+\.\d+' | sort -u | head -1)
+        ipv6_addr=$(echo "$resultado_grep" | grep "AAAA" | grep -oP '(?<=AAAA )[^"]+' | sort -u | head -1)
+        secao_config=""
+        [[ -n "$zone_type" ]] && secao_config+="  Zona  : $zone_type\n"
+        [[ -n "$ipv4_addr" ]] && secao_config+="  IPv4  : $ipv4_addr\n"
+        [[ -n "$ipv6_addr" ]] && secao_config+="  IPv6  : $ipv6_addr"
+        [[ -z "$secao_config" ]] && secao_config="  (nenhuma entrada encontrada)"
     else
         secao_config="  (nenhuma entrada encontrada)"
     fi
@@ -2475,7 +2483,7 @@ fn_verificar_bloqueio() {
     secao_dig=$(echo "$resultado_dig" | awk '
         /^;; ANSWER SECTION:/ { found=1; next }
         found && /^;;/        { found=0 }
-        found && NF           { print "  " $0 }
+        found && NF           { printf "  %-35s %s\n", $1, $NF }
     ')
     [[ -z "$secao_dig" ]] && secao_dig="  (sem resposta na ANSWER SECTION)"
 
