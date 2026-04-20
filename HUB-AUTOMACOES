@@ -1,9 +1,59 @@
 #!/bin/bash
 
+set -uo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+export APT_LISTCHANGES_FRONTEND=none
+
 if [[ $EUID -ne 0 ]]; then
     echo "Este script precisa ser executado como root"
     exit 1
 fi
+
+_distro_id=""
+_distro_version_id=""
+_distro_pretty="desconhecida"
+if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    _distro_id="${ID:-}"
+    _distro_version_id="${VERSION_ID:-}"
+    _distro_pretty="${PRETTY_NAME:-$ID $VERSION_ID}"
+fi
+
+if [[ "$_distro_id" != "debian" ]]; then
+    echo "ERRO: este script suporta apenas Debian (gerenciador apt)."
+    echo "Distribuicao detectada: $_distro_pretty"
+    echo "Distribuicoes como RHEL/Rocky/Ubuntu nao sao suportadas."
+    exit 1
+fi
+
+if ! [[ "$_distro_version_id" =~ ^1[3-9]$ ]]; then
+    echo "AVISO: este script foi projetado para Debian 13 (qualquer snapshot)."
+    echo "Versao detectada: $_distro_pretty"
+    read -rp "Prosseguir mesmo assim? (s/N): " _resp
+    [[ "${_resp,,}" != "s" ]] && exit 1
+fi
+
+declare -g -a acl_blocks=()
+declare -g acl_redes_internas="no"
+declare -g -a ipv4_list=()
+declare -g -a ipv6_list=()
+
+readonly HUB_LOG_FILE="/var/log/hub-automacoes.log"
+
+_hub_log() {
+    local level="$1"; shift
+    local msg="$*"
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    printf '[%s] [%s] [%s] %s\n' \
+        "$ts" "$level" "${SUDO_USER:-root}" "$msg" \
+        >> "$HUB_LOG_FILE" 2>/dev/null
+}
+
+touch "$HUB_LOG_FILE" 2>/dev/null && chmod 0640 "$HUB_LOG_FILE" 2>/dev/null
+_hub_log INFO "script iniciado (pid $$, distro $_distro_pretty)"
 
 is_private_ip() {
     local ip=$1
@@ -71,11 +121,11 @@ detectar_tier() {
 
 fn_coletar_acl() {
     declare -g -a acl_blocks=()
-    declare -g acl_redes_internas=1
+    declare -g acl_redes_internas="no"
 
     whiptail --title "Unbound - ACL Redes Internas" \
         --yesno "Deseja liberar automaticamente as redes privadas internas?\n\n  127.0.0.0/8\n  100.64.0.0/10\n  10.0.0.0/8\n  172.16.0.0/12\n  192.168.0.0/16\n  169.254.0.0/16\n  fc00::/7 (IPv6 ULA)" 20 60
-    acl_redes_internas=$?
+    [[ $? -eq 0 ]] && acl_redes_internas="yes" || acl_redes_internas="no"
 
     whiptail --title "Unbound - ACL" --msgbox \
 "Informe os blocos CIDR adicionais permitidos para consulta DNS.
@@ -103,7 +153,7 @@ EOF
     {
         echo "access-control: 127.0.0.0/8 allow"
         echo "access-control: ::1/128 allow"
-        if [[ "${acl_redes_internas:-1}" -eq 0 ]]; then
+        if [[ "${acl_redes_internas:-no}" == "yes" ]]; then
             echo "access-control: 100.64.0.0/10 allow"
             echo "access-control: 10.0.0.0/8 allow"
             echo "access-control: 172.16.0.0/12 allow"
@@ -389,6 +439,20 @@ fn_reverso() {
             --inputbox "Bloco IPv4 CIDR (ex: 192.168.0.0/22)\nDeixe vazio para finalizar:" 10 60 \
             3>&1 1>&2 2>&3)
         [[ $? -ne 0 || -z "$cidr" ]] && break
+
+        if ! [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$ ]]; then
+            whiptail --title "Erro" --msgbox "CIDR invalido: '$cidr'.\nFormato esperado: X.X.X.X/N (N entre 0 e 32)." 8 60
+            continue
+        fi
+
+        local _prefix="${cidr#*/}"
+        if (( _prefix <= 20 )); then
+            local _hosts=$(( 1 << (32 - _prefix) ))
+            whiptail --title "Zona Reversa - Bloco Grande" \
+                --yesno "O bloco '$cidr' contem $_hosts IPs.\nA geracao pode demorar e consumir memoria.\n\nProsseguir mesmo assim?" 12 70
+            [[ $? -ne 0 ]] && continue
+        fi
+
         cidrs+=("$cidr")
     done
 
@@ -419,6 +483,19 @@ fn_reverso() {
     if [[ -n "$ipv6_cidr" ]]; then
         ipv6_addr="${ipv6_cidr%/*}"
         ipv6_len="${ipv6_cidr#*/}"
+
+        if ! [[ "$ipv6_len" =~ ^[0-9]+$ ]] || (( ipv6_len < 1 || ipv6_len > 128 )); then
+            whiptail --title "Erro" --msgbox "Prefixo IPv6 invalido: '$ipv6_len'. Deve estar entre 1 e 128." 8 60
+            return 1
+        fi
+
+        if (( ipv6_len % 4 != 0 )); then
+            local _ajustado=$(( (ipv6_len / 4) * 4 ))
+            whiptail --title "Zona Reversa IPv6 - Aviso" \
+                --yesno "O prefixo /${ipv6_len} nao e multiplo de 4.\nA zona reversa sera truncada para /${_ajustado} (limite do ip6.arpa).\n\nProsseguir mesmo assim?" 12 70
+            [[ $? -ne 0 ]] && return 1
+        fi
+
         ipv6_expanded=$(expand_ipv6 "$ipv6_addr")
         ipv6_zone=$(ipv6_reverse_zone "$ipv6_expanded" "$ipv6_len")
         whiptail --title "Zona IPv6" --msgbox "Zona IPv6 gerada: $ipv6_zone" 8 60
@@ -435,57 +512,93 @@ fn_reverso() {
         done
     fi
 
-    > "$OUTPUT"
-    current_24=""
-
+    local _total_ptrs=0 _prefix_c
     for cidr in "${cidrs[@]}"; do
-        ip_part="${cidr%/*}"
-        prefix="${cidr#*/}"
-        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
-        start=$(( $(ip2int "$ip_part") & mask ))
-        end=$(( start | (~mask & 0xFFFFFFFF) ))
-
-        for (( i=start; i<=end; i++ )); do
-            a=$(( (i >> 24) & 255 ))
-            b=$(( (i >> 16) & 255 ))
-            c=$(( (i >> 8)  & 255 ))
-            d=$(( i & 255 ))
-            current_ip="${a}.${b}.${c}.${d}"
-            this_24="${a}.${b}.${c}"
-
-            if [[ "$this_24" != "$current_24" ]]; then
-                [[ -n "$current_24" ]] && echo "" >> "$OUTPUT"
-                echo "#---------------------------------ZONA ${this_24}------------------------------------" >> "$OUTPUT"
-                echo "" >> "$OUTPUT"
-                echo "local-zone: \"${c}.${b}.${a}.in-addr.arpa.\" transparent" >> "$OUTPUT"
-                echo "local-data: \"${c}.${b}.${a}.in-addr.arpa 10800 IN SOA hostmaster. nobody.invalid. 1 3600 1200 604800 10800\"" >> "$OUTPUT"
-                echo "" >> "$OUTPUT"
-                current_24="$this_24"
-            fi
-
-            if [[ -n "${special_ips[$current_ip]}" ]]; then
-                hostname="${special_ips[$current_ip]}"
-            else
-                hostname="${a}-${b}-${c}-${d}.${domain}"
-            fi
-
-            echo "local-data-ptr: \"${current_ip} ${hostname}\"" >> "$OUTPUT"
-        done
+        _prefix_c="${cidr#*/}"
+        _total_ptrs=$(( _total_ptrs + (1 << (32 - _prefix_c)) ))
     done
 
-    if [[ -n "$ipv6_zone" ]]; then
-        {
+    local _resumo="Resumo da geracao:\n\n"
+    _resumo+="  Blocos IPv4     : ${#cidrs[@]}\n"
+    for cidr in "${cidrs[@]}"; do
+        _resumo+="    - $cidr\n"
+    done
+    _resumo+="  Total de PTRs   : ${_total_ptrs}\n"
+    _resumo+="  Dominio padrao  : ${domain}\n"
+    _resumo+="  IPs especiais   : ${#special_ips[@]}\n"
+    [[ -n "$ipv6_zone" ]] && _resumo+="  Zona IPv6       : ${ipv6_zone}\n"
+    _resumo+="  Destino         : ${OUTPUT}\n\n"
+
+    if (( _total_ptrs >= 65536 )); then
+        _resumo+="ATENCAO: gerar ${_total_ptrs} PTRs pode levar varios minutos\n"
+        _resumo+="e consumir memoria significativa.\n\n"
+    fi
+
+    _resumo+="Confirmar geracao?"
+
+    whiptail --title "Zona Reversa - Confirmacao" --yesno "$_resumo" 24 75
+    [[ $? -ne 0 ]] && {
+        _hub_log INFO "fn_reverso: geracao cancelada pelo usuario (${_total_ptrs} PTRs)"
+        return 1
+    }
+
+    _hub_log AUDIT "fn_reverso: gerando ${_total_ptrs} PTRs (${#cidrs[@]} blocos v4, dominio=${domain})"
+
+    local _buf
+    _buf=$(mktemp)
+    current_24=""
+
+    {
+        for cidr in "${cidrs[@]}"; do
+            ip_part="${cidr%/*}"
+            prefix="${cidr#*/}"
+            mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+            start=$(( $(ip2int "$ip_part") & mask ))
+            end=$(( start | (~mask & 0xFFFFFFFF) ))
+
+            for (( i=start; i<=end; i++ )); do
+                a=$(( (i >> 24) & 255 ))
+                b=$(( (i >> 16) & 255 ))
+                c=$(( (i >> 8)  & 255 ))
+                d=$(( i & 255 ))
+                current_ip="${a}.${b}.${c}.${d}"
+                this_24="${a}.${b}.${c}"
+
+                if [[ "$this_24" != "$current_24" ]]; then
+                    [[ -n "$current_24" ]] && echo ""
+                    echo "#---------------------------------ZONA ${this_24}------------------------------------"
+                    echo ""
+                    echo "local-zone: \"${c}.${b}.${a}.in-addr.arpa.\" transparent"
+                    echo "local-data: \"${c}.${b}.${a}.in-addr.arpa 10800 IN SOA hostmaster. nobody.invalid. 1 3600 1200 604800 10800\""
+                    echo ""
+                    current_24="$this_24"
+                fi
+
+                if [[ -n "${special_ips[$current_ip]}" ]]; then
+                    hostname="${special_ips[$current_ip]}"
+                else
+                    hostname="${a}-${b}-${c}-${d}.${domain}"
+                fi
+
+                echo "local-data-ptr: \"${current_ip} ${hostname}\""
+            done
+        done
+
+        if [[ -n "$ipv6_zone" ]]; then
             echo ""
             echo "#===========================================ZONA REVERSA IPv6========================================="
             echo ""
             echo "local-zone: \"${ipv6_zone}\" transparent"
             echo "local-data: \"${ipv6_zone%.} 10800 IN SOA hostmaster. nobody.invalid. 1 3600 1200 604800 10800\""
             echo ""
-        } >> "$OUTPUT"
-        for sip6 in "${!ipv6_special[@]}"; do
-            echo "local-data-ptr: \"${sip6} ${ipv6_special[$sip6]}\"" >> "$OUTPUT"
-        done
-    fi
+            for sip6 in "${!ipv6_special[@]}"; do
+                echo "local-data-ptr: \"${sip6} ${ipv6_special[$sip6]}\""
+            done
+        fi
+    } > "$_buf"
+
+    install -m 0644 -o root -g root "$_buf" "$OUTPUT"
+    rm -f "$_buf"
 
     if unbound-checkconf > /dev/null 2>&1; then
         systemctl restart unbound
@@ -504,186 +617,229 @@ fn_monitor_unbound() {
     whiptail --title "Concluido" --msgbox "Servico de monitoramento do Unbound instalado e ativado." 8 60
 }
 
+_ipt_add_port_rule() {
+    local -n _rules_v4=$1
+    local -n _rules_v6=$2
+    local proto=$3
+    local port=$4
+    local src=$5
+
+    if [[ -z "$src" ]]; then
+        _rules_v4+=("-A INPUT -p ${proto} --dport ${port} -j ACCEPT")
+        _rules_v6+=("-A INPUT -p ${proto} --dport ${port} -j ACCEPT")
+    elif [[ "$src" == *:* ]]; then
+        _rules_v6+=("-A INPUT -p ${proto} -s ${src} --dport ${port} -j ACCEPT")
+    else
+        _rules_v4+=("-A INPUT -p ${proto} -s ${src} --dport ${port} -j ACCEPT")
+    fi
+}
+
+_coletar_origens() {
+    local -n _out=$1
+    local titulo=$2
+    local prompt=$3
+    while true; do
+        local src
+        src=$(whiptail --title "$titulo" --inputbox "$prompt" 10 60 3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$src" ]] && break
+        _out+=("$src")
+    done
+}
+
+_aplicar_ruleset() {
+    local -n _rules_v4=$1
+    local -n _rules_v6=$2
+
+    local tmp_v4 tmp_v6
+    tmp_v4=$(mktemp)
+    tmp_v6=$(mktemp)
+
+    {
+        echo "*filter"
+        echo ":INPUT DROP [0:0]"
+        echo ":FORWARD DROP [0:0]"
+        echo ":OUTPUT ACCEPT [0:0]"
+        for r in "${_rules_v4[@]}"; do echo "$r"; done
+        echo "COMMIT"
+    } > "$tmp_v4"
+
+    {
+        echo "*filter"
+        echo ":INPUT DROP [0:0]"
+        echo ":FORWARD DROP [0:0]"
+        echo ":OUTPUT ACCEPT [0:0]"
+        for r in "${_rules_v6[@]}"; do echo "$r"; done
+        echo "COMMIT"
+    } > "$tmp_v6"
+
+    if ! iptables-restore --test < "$tmp_v4" 2>/dev/null; then
+        whiptail --title "Erro - iptables" --msgbox "Ruleset IPv4 invalido. Regras NAO aplicadas.\nArquivo preservado: $tmp_v4" 10 70
+        return 1
+    fi
+    if ! ip6tables-restore --test < "$tmp_v6" 2>/dev/null; then
+        whiptail --title "Erro - ip6tables" --msgbox "Ruleset IPv6 invalido. Regras NAO aplicadas.\nArquivo preservado: $tmp_v6" 10 70
+        return 1
+    fi
+
+    iptables-restore  < "$tmp_v4"
+    ip6tables-restore < "$tmp_v6"
+
+    rm -f "$tmp_v4" "$tmp_v6"
+    return 0
+}
+
+_ipt_liberar_dns() {
+    local -n __r4=$1
+    local -n __r6=$2
+    local allow_any_fallback="${3:-0}"
+
+    local blocos_dns=()
+    [[ "${acl_redes_internas:-no}" == "yes" ]] && blocos_dns+=("127.0.0.0/8" "100.64.0.0/10" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "169.254.0.0/16" "fc00::/7")
+    for b in "${acl_blocks[@]:-}"; do [[ -n "$b" ]] && blocos_dns+=("$b"); done
+
+    local dns_origins=()
+    if [[ ${#blocos_dns[@]} -gt 0 ]]; then
+        local blocos_fmt=""
+        for b in "${blocos_dns[@]}"; do blocos_fmt+="  $b\n"; done
+        whiptail --title "iptables - DNS porta 53" \
+            --yesno "Os seguintes blocos foram liberados no Unbound:\n\n${blocos_fmt}\nDeseja liberar os mesmos na porta 53 do iptables?" 20 60
+        if [[ $? -eq 0 ]]; then
+            dns_origins=("${blocos_dns[@]}")
+        else
+            _coletar_origens dns_origins "iptables - DNS" \
+                "Origem permitida para porta 53 (CIDR ou IP)\nDeixe vazio para finalizar:"
+        fi
+    elif [[ "$allow_any_fallback" == "1" ]]; then
+        whiptail --title "iptables - DNS (porta 53)" \
+            --yesno "Liberar porta 53 para qualquer origem?" 8 55
+        if [[ $? -eq 0 ]]; then
+            dns_origins=("")
+        else
+            _coletar_origens dns_origins "iptables - DNS" \
+                "Origem permitida para porta 53 (CIDR ou IP)\nDeixe vazio para finalizar:"
+        fi
+    else
+        return 0
+    fi
+
+    for src in "${dns_origins[@]}"; do
+        _ipt_add_port_rule __r4 __r6 tcp 53 "$src"
+        _ipt_add_port_rule __r4 __r6 udp 53 "$src"
+    done
+}
+
+_ipt_liberar_zabbix() {
+    local -n __r4=$1
+    local -n __r6=$2
+    local zabbix_src
+    zabbix_src=$(whiptail --title "iptables - Zabbix" \
+        --inputbox "Origem para porta 10050 do Zabbix (CIDR ou IP):" 10 60 \
+        3>&1 1>&2 2>&3)
+    if [[ $? -eq 0 && -n "$zabbix_src" ]]; then
+        _ipt_add_port_rule __r4 __r6 tcp 10050 "$zabbix_src"
+        _ipt_add_port_rule __r4 __r6 udp 10050 "$zabbix_src"
+    fi
+}
+
+_ipt_loop_custom_ports() {
+    local -n __r4=$1
+    local -n __r6=$2
+    local porta_custom
+    while true; do
+        porta_custom=$(whiptail --title "iptables - Porta Customizada" \
+            --inputbox "Porta adicional para liberar (deixe vazio para finalizar):" 8 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$porta_custom" ]] && break
+        if ! [[ "$porta_custom" =~ ^[0-9]+$ ]] || (( porta_custom < 1 || porta_custom > 65535 )); then
+            whiptail --title "Erro" --msgbox "Porta invalida: '$porta_custom'." 8 50
+            continue
+        fi
+
+        local custom_origins=()
+        whiptail --title "iptables - Porta $porta_custom" \
+            --yesno "Liberar porta $porta_custom para qualquer origem?" 8 55
+        if [[ $? -eq 0 ]]; then
+            custom_origins=("")
+        else
+            _coletar_origens custom_origins "iptables - Porta $porta_custom" \
+                "Origem para porta $porta_custom (CIDR ou IP)\nDeixe vazio para finalizar:"
+        fi
+
+        for src in "${custom_origins[@]}"; do
+            _ipt_add_port_rule __r4 __r6 tcp "$porta_custom" "$src"
+            _ipt_add_port_rule __r4 __r6 udp "$porta_custom" "$src"
+        done
+    done
+}
+
 fn_iptables() {
-    local contexto="$1"
+    local contexto="${1:-}"
 
     apt install iptables iptables-persistent -y
 
-    declare -a ssh_origins
-    while true; do
-        ssh_src=$(whiptail --title "iptables - SSH" \
-            --inputbox "Origem permitida para SSH (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
-            3>&1 1>&2 2>&3)
-        [[ $? -ne 0 || -z "$ssh_src" ]] && break
-        ssh_origins+=("$ssh_src")
-    done
+    declare -a ssh_origins=()
+    declare -a rules_v4=(
+        "-A INPUT -i lo -j ACCEPT"
+        "-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT"
+        "-A INPUT -p icmp -j ACCEPT"
+        "-A OUTPUT -p icmp -j ACCEPT"
+    )
+    declare -a rules_v6=(
+        "-A INPUT -i lo -j ACCEPT"
+        "-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT"
+        "-A INPUT -p ipv6-icmp -j ACCEPT"
+        "-A OUTPUT -p ipv6-icmp -j ACCEPT"
+    )
 
-    for ipt in iptables ip6tables; do
-        $ipt -F
-        $ipt -P INPUT DROP
-        $ipt -P FORWARD DROP
-        $ipt -P OUTPUT ACCEPT
-        $ipt -A INPUT -i lo -j ACCEPT
-        $ipt -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
-    done
-
-    iptables -A INPUT -p icmp -j ACCEPT
-    iptables -A OUTPUT -p icmp -j ACCEPT
-    ip6tables -I INPUT 1 -p ipv6-icmp -j ACCEPT
-    ip6tables -A OUTPUT -p ipv6-icmp -j ACCEPT
+    _coletar_origens ssh_origins "iptables - SSH" \
+        "Origem permitida para SSH (CIDR ou IP)\nDeixe vazio para finalizar:"
 
     for src in "${ssh_origins[@]}"; do
-        if [[ "$src" == *:* ]]; then
-            ip6tables -A INPUT -p tcp -s "$src" --dport 22 -j ACCEPT
-        else
-            iptables -A INPUT -p tcp -s "$src" --dport 22 -j ACCEPT
-        fi
+        _ipt_add_port_rule rules_v4 rules_v6 tcp 22 "$src"
     done
 
     if systemctl cat unbound &>/dev/null; then
         whiptail --title "iptables - DNS (porta 53)" \
             --yesno "Unbound detectado. Deseja liberar a porta 53?" 8 55
-        if [[ $? -eq 0 ]]; then
-            local blocos_dns=()
-            [[ "${acl_redes_internas:-1}" -eq 0 ]] && blocos_dns+=("127.0.0.0/8" "100.64.0.0/10" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "169.254.0.0/16" "fc00::/7")
-            for b in "${acl_blocks[@]:-}"; do [[ -n "$b" ]] && blocos_dns+=("$b"); done
-
-            if [[ ${#blocos_dns[@]} -gt 0 ]]; then
-                local blocos_fmt=""
-                for b in "${blocos_dns[@]}"; do blocos_fmt+="  $b\n"; done
-                whiptail --title "iptables - DNS porta 53" \
-                    --yesno "Os seguintes blocos foram liberados no Unbound:\n\n${blocos_fmt}\nDeseja liberar os mesmos na porta 53 do iptables?" 20 60
-                if [[ $? -eq 0 ]]; then
-                    for block in "${blocos_dns[@]}"; do
-                        if [[ "$block" == *:* ]]; then
-                            ip6tables -A INPUT -p tcp -s "$block" --dport 53 -j ACCEPT
-                            ip6tables -A INPUT -p udp -s "$block" --dport 53 -j ACCEPT
-                        else
-                            iptables -A INPUT -p tcp -s "$block" --dport 53 -j ACCEPT
-                            iptables -A INPUT -p udp -s "$block" --dport 53 -j ACCEPT
-                        fi
-                    done
-                else
-                    while true; do
-                        dns_src=$(whiptail --title "iptables - DNS" \
-                            --inputbox "Origem permitida para porta 53 (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
-                            3>&1 1>&2 2>&3)
-                        [[ $? -ne 0 || -z "$dns_src" ]] && break
-                        if [[ "$dns_src" == *:* ]]; then
-                            ip6tables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
-                            ip6tables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
-                        else
-                            iptables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
-                            iptables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
-                        fi
-                    done
-                fi
-            else
-                whiptail --title "iptables - DNS (porta 53)" \
-                    --yesno "Liberar porta 53 para qualquer origem?" 8 55
-                if [[ $? -eq 0 ]]; then
-                    for ipt in iptables ip6tables; do
-                        $ipt -A INPUT -p tcp --dport 53 -j ACCEPT
-                        $ipt -A INPUT -p udp --dport 53 -j ACCEPT
-                    done
-                else
-                    while true; do
-                        dns_src=$(whiptail --title "iptables - DNS" \
-                            --inputbox "Origem permitida para porta 53 (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
-                            3>&1 1>&2 2>&3)
-                        [[ $? -ne 0 || -z "$dns_src" ]] && break
-                        if [[ "$dns_src" == *:* ]]; then
-                            ip6tables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
-                            ip6tables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
-                        else
-                            iptables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
-                            iptables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
-                        fi
-                    done
-                fi
-            fi
-        fi
+        [[ $? -eq 0 ]] && _ipt_liberar_dns rules_v4 rules_v6 1
     fi
 
     if systemctl cat krill &>/dev/null || systemctl cat routinator &>/dev/null; then
         whiptail --title "iptables - RPKI (3000/8323/3323)" \
             --yesno "RPKI detectado. Deseja liberar as portas 3000, 8323 e 3323?" 8 60
         if [[ $? -eq 0 ]]; then
+            local rpki_origins=()
             whiptail --title "iptables - RPKI" \
                 --yesno "Liberar portas RPKI para qualquer origem?" 8 55
             if [[ $? -eq 0 ]]; then
-                for ipt in iptables ip6tables; do
-                    $ipt -A INPUT -p tcp --dport 3000 -j ACCEPT
-                    $ipt -A INPUT -p tcp --dport 8323 -j ACCEPT
-                    $ipt -A INPUT -p tcp --dport 3323 -j ACCEPT
-                done
+                rpki_origins=("")
             else
-                while true; do
-                    rpki_src=$(whiptail --title "iptables - RPKI" \
-                        --inputbox "Origem permitida para portas RPKI (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
-                        3>&1 1>&2 2>&3)
-                    [[ $? -ne 0 || -z "$rpki_src" ]] && break
-                    if [[ "$rpki_src" == *:* ]]; then
-                        ip6tables -A INPUT -p tcp -s "$rpki_src" --dport 3000 -j ACCEPT
-                        ip6tables -A INPUT -p tcp -s "$rpki_src" --dport 8323 -j ACCEPT
-                        ip6tables -A INPUT -p tcp -s "$rpki_src" --dport 3323 -j ACCEPT
-                    else
-                        iptables -A INPUT -p tcp -s "$rpki_src" --dport 3000 -j ACCEPT
-                        iptables -A INPUT -p tcp -s "$rpki_src" --dport 8323 -j ACCEPT
-                        iptables -A INPUT -p tcp -s "$rpki_src" --dport 3323 -j ACCEPT
-                    fi
-                done
+                _coletar_origens rpki_origins "iptables - RPKI" \
+                    "Origem permitida para portas RPKI (CIDR ou IP)\nDeixe vazio para finalizar:"
             fi
+
+            for src in "${rpki_origins[@]}"; do
+                _ipt_add_port_rule rules_v4 rules_v6 tcp 3000 "$src"
+                _ipt_add_port_rule rules_v4 rules_v6 tcp 8323 "$src"
+                _ipt_add_port_rule rules_v4 rules_v6 tcp 3323 "$src"
+            done
         fi
     fi
 
     if systemctl is-active --quiet zabbix-agent2 2>/dev/null; then
-        zabbix_src=$(whiptail --title "iptables - Zabbix" \
-            --inputbox "Origem para porta 10050 do Zabbix (CIDR ou IP):" 10 60 \
-            3>&1 1>&2 2>&3)
-        if [[ $? -eq 0 && -n "$zabbix_src" ]]; then
-            if [[ "$zabbix_src" == *:* ]]; then
-                ip6tables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
-                ip6tables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
-            else
-                iptables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
-                iptables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
-            fi
-        fi
+        _ipt_liberar_zabbix rules_v4 rules_v6
     fi
 
-    while true; do
-        porta_custom=$(whiptail --title "iptables - Porta Customizada" \
-            --inputbox "Porta adicional para liberar (deixe vazio para finalizar):" 8 60 \
-            3>&1 1>&2 2>&3)
-        [[ $? -ne 0 || -z "$porta_custom" ]] && break
+    _ipt_loop_custom_ports rules_v4 rules_v6
 
-        whiptail --title "iptables - Porta $porta_custom" \
-            --yesno "Liberar porta $porta_custom para qualquer origem?" 8 55
-        if [[ $? -eq 0 ]]; then
-            for ipt in iptables ip6tables; do
-                $ipt -A INPUT -p tcp --dport "$porta_custom" -j ACCEPT
-                $ipt -A INPUT -p udp --dport "$porta_custom" -j ACCEPT
-            done
-        else
-            while true; do
-                custom_src=$(whiptail --title "iptables - Porta $porta_custom" \
-                    --inputbox "Origem para porta $porta_custom (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
-                    3>&1 1>&2 2>&3)
-                [[ $? -ne 0 || -z "$custom_src" ]] && break
-                if [[ "$custom_src" == *:* ]]; then
-                    ip6tables -A INPUT -p tcp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
-                    ip6tables -A INPUT -p udp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
-                else
-                    iptables -A INPUT -p tcp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
-                    iptables -A INPUT -p udp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
-                fi
-            done
-        fi
-    done
+    if ! _aplicar_ruleset rules_v4 rules_v6; then
+        _hub_log ERROR "iptables: falha ao aplicar ruleset (contexto=${contexto:-manual})"
+        return 1
+    fi
 
     netfilter-persistent save
-    whiptail --title "Concluido" --msgbox "Regras de iptables (IPv4 e IPv6) aplicadas e salvas." 8 55
+    _hub_log AUDIT "iptables: ruleset aplicado (${#rules_v4[@]} regras v4, ${#rules_v6[@]} regras v6, contexto=${contexto:-manual})"
+    whiptail --title "Concluido" --msgbox "Regras de iptables (IPv4 e IPv6) aplicadas atomicamente e salvas." 8 65
 }
 
 preparar_zabbix() {
@@ -717,7 +873,7 @@ preparar_zabbix() {
                    -o APT::Get::List-Cleanup="0" 2>/dev/null || apt update
     fi
 
-    DEBIAN_FRONTEND=noninteractive apt install -y \
+    apt install -y \
         -o Dpkg::Options::="--force-confold" \
         zabbix-agent2
 }
@@ -772,42 +928,10 @@ EOF
     fn_firewall_zabbix
 }
 
-fn_zabbix_unbound() {
-    fn_zabbix_comum
-
-    cat > /etc/unbound/unbound.conf.d/statistics-enable.conf <<EOF
-server:
-    statistics-interval: 0
-    statistics-cumulative: no
-    extended-statistics: yes
-
-remote-control:
-    control-enable: yes
-    control-interface: 127.0.0.1
-    control-port: 8953
-    server-key-file: "/etc/unbound/unbound_server.key"
-    server-cert-file: "/etc/unbound/unbound_server.pem"
-    control-key-file: "/etc/unbound/unbound_control.key"
-    control-cert-file: "/etc/unbound/unbound_control.pem"
-EOF
-
-    unbound-control-setup
-
-    apt install sudo -y
-
-    cat > /etc/sudoers.d/zabbix-agent <<EOF
-Defaults:zabbix !requiretty
-zabbix ALL = NOPASSWD: /usr/sbin/unbound-control
-EOF
-
-    chmod 0440 /etc/sudoers.d/zabbix-agent
-    usermod -a -G unbound zabbix
-
-    if ! grep -q "unbound-control stats_noreset" /etc/sudoers; then
-        echo "zabbix ALL=(ALL) NOPASSWD: /usr/sbin/unbound-control stats_noreset" >> /etc/sudoers
-    fi
-
-    cat > /etc/zabbix/zabbix_agent2.d/userparameter_unbound.conf <<'EOF'
+_escrever_userparameter_unbound() {
+    local dest="/etc/zabbix/zabbix_agent2.d/userparameter_unbound.conf"
+    mkdir -p /etc/zabbix/zabbix_agent2.d
+    cat > "$dest" <<'EOF'
 UserParameter=unbound.service,systemctl is-active unbound >/dev/null 2>&1 && echo 1 || echo 0
 UserParameter=unbound.service.status,systemctl status unbound --no-pager -l 2>/dev/null | head -3 | tail -1 | awk '{print $2}' || echo "unknown"
 UserParameter=unbound.time.up,sudo /usr/sbin/unbound-control stats_noreset | grep "time.up=" | cut -d= -f2
@@ -886,8 +1010,51 @@ UserParameter=unbound.histogram.0.016to0.032,sudo /usr/sbin/unbound-control stat
 UserParameter=unbound.histogram.2.048to4.096,sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.0000002.048000.000000.to.0000004.096000.000000=" | cut -d= -f2
 UserParameter=unbound.query.ipv6,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.ipv6=" | cut -d= -f2
 EOF
+    chmod 644 "$dest"
+}
 
-    chmod 644 /etc/zabbix/zabbix_agent2.d/userparameter_unbound.conf
+fn_zabbix_unbound() {
+    fn_zabbix_comum
+
+    cat > /etc/unbound/unbound.conf.d/statistics-enable.conf <<EOF
+server:
+    statistics-interval: 0
+    statistics-cumulative: no
+    extended-statistics: yes
+
+remote-control:
+    control-enable: yes
+    control-interface: 127.0.0.1
+    control-port: 8953
+    server-key-file: "/etc/unbound/unbound_server.key"
+    server-cert-file: "/etc/unbound/unbound_server.pem"
+    control-key-file: "/etc/unbound/unbound_control.key"
+    control-cert-file: "/etc/unbound/unbound_control.pem"
+EOF
+
+    unbound-control-setup
+
+    apt install sudo -y
+
+    local sudoers_tmp
+    sudoers_tmp=$(mktemp)
+    cat > "$sudoers_tmp" <<EOF
+Defaults:zabbix !requiretty
+zabbix ALL = NOPASSWD: /usr/sbin/unbound-control
+EOF
+
+    if visudo -cf "$sudoers_tmp" >/dev/null 2>&1; then
+        install -m 0440 -o root -g root "$sudoers_tmp" /etc/sudoers.d/zabbix-agent
+    else
+        whiptail --title "Erro - sudoers" --msgbox "Falha na validacao do dropin sudoers. Regra NAO aplicada.\nArquivo temporario: $sudoers_tmp" 10 70
+        rm -f "$sudoers_tmp"
+        return 1
+    fi
+    rm -f "$sudoers_tmp"
+
+    usermod -a -G unbound zabbix
+
+    _escrever_userparameter_unbound
     systemctl restart unbound
     systemctl restart zabbix-agent2
     sys_hostname=$(hostname)
@@ -1039,7 +1206,9 @@ fn_rota_persistente() {
 
     cat > /usr/local/bin/rota_persistente.sh << EOF
 #!/bin/bash
-ip route del default dev $iface
+if ip route show default dev $iface 2>/dev/null | grep -q .; then
+    ip route del default dev $iface
+fi
 ip route add default via $gateway dev $iface src $src_ip
 EOF
 
@@ -1065,8 +1234,10 @@ EOF
     systemctl enable --now rota-persistente
 
     if systemctl is-active --quiet rota-persistente; then
+        _hub_log AUDIT "rota persistente aplicada: iface=$iface gw=$gateway src=$src_ip"
         whiptail --title "Concluido" --msgbox "Rota persistente configurada e servico ativado com sucesso.\n\n  Interface : $iface\n  Gateway   : $gateway\n  IP origem : $src_ip" 12 60
     else
+        _hub_log ERROR "rota persistente configurada mas servico nao iniciou: iface=$iface gw=$gateway src=$src_ip"
         whiptail --title "Atencao" --msgbox "Rota configurada, porem o servico nao iniciou. Verifique com:\nsystemctl status rota-persistente" 10 60
     fi
 }
@@ -1117,6 +1288,14 @@ EOF
 }
 
 fn_mc() {
+    local _arch
+    _arch=$(uname -m)
+    if [[ "$_arch" != "x86_64" ]]; then
+        whiptail --title "Erro - Arquitetura" \
+            --msgbox "O instalador do MC suporta apenas x86_64.\nArquitetura detectada: $_arch\n\nInstalacao abortada." 10 60
+        return 1
+    fi
+
     cd /tmp || return 1
 
     wget -O install-x86_64.sh https://static.minhaconexao.com.br/mc-server-scripts/3.0.7/install-x86_64.sh
@@ -1150,7 +1329,10 @@ fn_nperf() {
         | tee /etc/apt/sources.list.d/nperf.list > /dev/null
 
     apt-get update
-    apt-get install -y nperf-server
+    apt-get install -y \
+        -o Dpkg::Options::="--force-confold" \
+        -o Dpkg::Options::="--force-confdef" \
+        nperf-server
 
     if [[ $? -ne 0 ]]; then
         whiptail --title "Erro" --msgbox "Falha ao instalar o nperf-server. Verifique os logs do apt." 8 60
@@ -1229,7 +1411,7 @@ fn_adicionar_usuario() {
     fi
 
     useradd -m -s /bin/bash "$nome"
-    echo "$nome:$senha" | chpasswd
+    chpasswd <<< "$nome:$senha"
 
     case "$nivel" in
         2)
@@ -1237,8 +1419,17 @@ fn_adicionar_usuario() {
             ;;
         3)
             usermod -aG sudo "$nome"
-            echo "$nome ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$nome
-            chmod 0440 /etc/sudoers.d/$nome
+            local sudoers_tmp
+            sudoers_tmp=$(mktemp)
+            printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$nome" > "$sudoers_tmp"
+            if visudo -cf "$sudoers_tmp" >/dev/null 2>&1; then
+                install -m 0440 -o root -g root "$sudoers_tmp" "/etc/sudoers.d/$nome"
+            else
+                whiptail --title "Erro - sudoers" --msgbox "Falha na validacao do dropin sudoers para '$nome'.\nRegra NAO aplicada." 10 60
+                rm -f "$sudoers_tmp"
+                return 1
+            fi
+            rm -f "$sudoers_tmp"
             ;;
     esac
 
@@ -1249,6 +1440,7 @@ fn_adicionar_usuario() {
         3) desc="Sudo sem senha" ;;
     esac
 
+    _hub_log AUDIT "usuario criado: '$nome' (nivel=$desc)"
     whiptail --title "Concluido" --msgbox "Usuario criado com sucesso.\n\n  Usuario    : $nome\n  Permissao  : $desc" 10 50
 }
 
@@ -1329,6 +1521,11 @@ fn_tcpdump() {
         3>&1 1>&2 2>&3)
     [[ $? -ne 0 ]] && return 1
 
+    if [[ -n "$porta" ]] && ! [[ "$porta" =~ ^[0-9]+$ ]]; then
+        whiptail --title "Erro" --msgbox "Porta invalida: '$porta'. Use apenas digitos." 8 60
+        return 1
+    fi
+
     local filtro=""
     case "$proto" in
         2) filtro="tcp" ;;
@@ -1336,31 +1533,33 @@ fn_tcpdump() {
         4) filtro="icmp" ;;
     esac
 
-    [[ -n "$porta" ]] && filtro+="${filtro:+ and }port $porta"
-    [[ -n "$origem" ]] && filtro+="${filtro:+ and }src host $origem"
+    [[ -n "$porta"   ]] && filtro+="${filtro:+ and }port $porta"
+    [[ -n "$origem"  ]] && filtro+="${filtro:+ and }src host $origem"
     [[ -n "$destino" ]] && filtro+="${filtro:+ and }dst host $destino"
 
-    local cmd="tcpdump -i $iface -n"
-    [[ -n "$filtro" ]] && cmd+=" '$filtro'"
-    [[ "$modo" == "2" ]] && cmd+=" -w /tmp/captura.pcap"
+    local cmd_args=(tcpdump -i "$iface" -n)
+    [[ "$modo" == "2" ]] && cmd_args+=(-w /tmp/captura.pcap)
+    [[ -n "$filtro"   ]] && cmd_args+=("$filtro")
 
-    whiptail --title "tcpdump" --msgbox "Iniciando captura. Pressione Ctrl+C para encerrar.\n\nComando: $cmd" 10 70
+    whiptail --title "tcpdump" --msgbox "Iniciando captura. Pressione Ctrl+C para encerrar.\n\nComando: ${cmd_args[*]}" 10 70
 
-    eval "$cmd"
+    "${cmd_args[@]}"
 
     [[ "$modo" == "2" ]] && whiptail --title "Concluido" --msgbox "Captura salva em /tmp/captura.pcap" 8 50
 }
 
 fn_status_servicos() {
-    local msg=""
+    local _tmp
+    _tmp=$(mktemp)
 
     while IFS= read -r linha; do
         svc=$(echo "$linha" | awk '{print $1}' | sed 's/\.service//')
         status=$(echo "$linha" | awk '{print $3}')
-        msg+="$(printf '%-35s %s\n' "$svc" "$status")"$'\n'
+        printf '%-35s %s\n' "$svc" "$status" >> "$_tmp"
     done < <(systemctl list-units --type=service --no-legend --no-pager 2>/dev/null)
 
-    whiptail --title "Status dos Servicos" --msgbox "$msg" 30 70
+    whiptail --title "Status dos Servicos" --textbox "$_tmp" 30 80
+    rm -f "$_tmp"
 }
 
 fn_reiniciar_servico() {
@@ -1426,6 +1625,7 @@ fn_remover_usuario() {
 
     rm -f /etc/sudoers.d/"$nome"
 
+    _hub_log AUDIT "usuario removido: '$nome' (home_removido=$([[ $remover_home -eq 0 ]] && echo sim || echo nao))"
     whiptail --title "Concluido" --msgbox "Usuario '$nome' removido com sucesso." 8 50
 }
 
@@ -1474,7 +1674,8 @@ fn_alterar_senha() {
         3>&1 1>&2 2>&3)
     [[ $? -ne 0 || -z "$senha" ]] && return 1
 
-    echo "$nome:$senha" | chpasswd
+    chpasswd <<< "$nome:$senha"
+    _hub_log AUDIT "senha alterada para: '$nome'"
     whiptail --title "Concluido" --msgbox "Senha do usuario '$nome' alterada com sucesso." 8 55
 }
 
@@ -1496,35 +1697,63 @@ fn_snmpwalk() {
         3>&1 1>&2 2>&3)
     [[ $? -ne 0 || -z "$ip_alvo" ]] && return 1
 
-    community=$(whiptail --title "SNMPwalk - Community" \
-        --menu "Selecione a community:" 12 55 3 \
-        "1" "1Pv7sNMPC0m" \
-        "2" "M4tr1Xc0rP" \
-        "3" "Outra" \
-        3>&1 1>&2 2>&3)
-    [[ $? -ne 0 ]] && return 1
+    local snmp_conf="/etc/hub-automacoes/snmp.conf"
+    local comm=""
+    declare -a saved_names=()
+    declare -a saved_values=()
 
-    case "$community" in
-        1) comm="1Pv7sNMPC0m" ;;
-        2) comm="M4tr1Xc0rP" ;;
-        3)
+    if [[ -r "$snmp_conf" ]]; then
+        while IFS='=' read -r key val; do
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            key="${key## }"; key="${key%% }"
+            val="${val## }"; val="${val%% }"
+            [[ -z "$key" || -z "$val" ]] && continue
+            saved_names+=("$key")
+            saved_values+=("$val")
+        done < "$snmp_conf"
+    fi
+
+    if [[ ${#saved_names[@]} -gt 0 ]]; then
+        local menu_opts=()
+        local i
+        for ((i=0; i<${#saved_names[@]}; i++)); do
+            menu_opts+=("$((i+1))" "${saved_names[$i]}")
+        done
+        local manual_idx=$(( ${#saved_names[@]} + 1 ))
+        menu_opts+=("$manual_idx" "Digitar manualmente")
+
+        local escolha
+        escolha=$(whiptail --title "SNMPwalk - Community" \
+            --menu "Selecione a community:" 16 60 8 \
+            "${menu_opts[@]}" \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && return 1
+
+        if [[ "$escolha" == "$manual_idx" ]]; then
             comm=$(whiptail --title "SNMPwalk - Community" \
-                --inputbox "Digite a community:" 8 50 \
+                --passwordbox "Digite a community:" 8 60 \
                 3>&1 1>&2 2>&3)
             [[ $? -ne 0 || -z "$comm" ]] && return 1
-            ;;
-    esac
+        else
+            comm="${saved_values[$((escolha - 1))]}"
+        fi
+    else
+        comm=$(whiptail --title "SNMPwalk - Community" \
+            --passwordbox "Digite a community:\n\nPara salvar communities de uso frequente, crie:\n  ${snmp_conf}\nFormato: NOME=valor (uma por linha)\nAjuste permissoes: chmod 600" 14 70 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$comm" ]] && return 1
+    fi
 
     oid=$(whiptail --title "SNMPwalk - OID" \
         --inputbox "OID (deixe vazio para consultar tudo):" 8 60 \
         3>&1 1>&2 2>&3)
 
-    local cmd="snmpwalk -v$snmp_ver -c $comm $ip_alvo"
-    [[ -n "$oid" ]] && cmd+=" $oid"
+    local cmd_args=(snmpwalk "-v$snmp_ver" -c "$comm" "$ip_alvo")
+    [[ -n "$oid" ]] && cmd_args+=("$oid")
 
-    whiptail --title "SNMPwalk" --msgbox "Executando consulta. O resultado sera exibido no terminal.\n\nComando: $cmd" 10 70
+    whiptail --title "SNMPwalk" --msgbox "Executando consulta. O resultado sera exibido no terminal.\n\nComando: snmpwalk -v$snmp_ver -c *** $ip_alvo ${oid}" 10 70
 
-    eval "$cmd"
+    "${cmd_args[@]}"
 
     whiptail --title "SNMPwalk" --msgbox "Consulta finalizada. Pressione Ok para voltar ao menu." 8 55
 }
@@ -1763,128 +1992,48 @@ ANALISE:
 fn_iptables_anycast() {
     apt install iptables iptables-persistent -y
 
-    declare -a ssh_origins
-    while true; do
-        ssh_src=$(whiptail --title "iptables - SSH" \
-            --inputbox "Origem permitida para SSH (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
-            3>&1 1>&2 2>&3)
-        [[ $? -ne 0 || -z "$ssh_src" ]] && break
-        ssh_origins+=("$ssh_src")
-    done
+    declare -a ssh_origins=()
+    declare -a rules_v4=(
+        "-A INPUT -i lo -j ACCEPT"
+        "-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT"
+        "-A INPUT -p icmp -j ACCEPT"
+        "-A OUTPUT -p icmp -j ACCEPT"
+    )
+    declare -a rules_v6=(
+        "-A INPUT -i lo -j ACCEPT"
+        "-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT"
+        "-A INPUT -p ipv6-icmp -j ACCEPT"
+        "-A OUTPUT -p ipv6-icmp -j ACCEPT"
+    )
 
-    for ipt in iptables ip6tables; do
-        $ipt -F
-        $ipt -P INPUT DROP
-        $ipt -P FORWARD DROP
-        $ipt -P OUTPUT ACCEPT
-        $ipt -A INPUT -i lo -j ACCEPT
-        $ipt -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
-    done
-
-    iptables -A INPUT -p icmp -j ACCEPT
-    iptables -A OUTPUT -p icmp -j ACCEPT
-    ip6tables -I INPUT 1 -p ipv6-icmp -j ACCEPT
-    ip6tables -A OUTPUT -p ipv6-icmp -j ACCEPT
+    _coletar_origens ssh_origins "iptables - SSH" \
+        "Origem permitida para SSH (CIDR ou IP)\nDeixe vazio para finalizar:"
 
     for src in "${ssh_origins[@]}"; do
-        if [[ "$src" == *:* ]]; then
-            ip6tables -A INPUT -p tcp -s "$src" --dport 22 -j ACCEPT
-        else
-            iptables -A INPUT -p tcp -s "$src" --dport 22 -j ACCEPT
-        fi
+        _ipt_add_port_rule rules_v4 rules_v6 tcp 22 "$src"
     done
 
-    local blocos_acl=()
-    [[ $acl_redes_internas -eq 0 ]] && blocos_acl+=("127.0.0.0/8" "100.64.0.0/10" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "169.254.0.0/16" "fc00::/7")
-    for b in "${acl_blocks[@]}"; do blocos_acl+=("$b"); done
-
-    if [[ ${#blocos_acl[@]} -gt 0 ]]; then
-        local blocos_fmt=""
-        for b in "${blocos_acl[@]}"; do blocos_fmt+="  $b\n"; done
-
-        whiptail --title "iptables - DNS porta 53" \
-            --yesno "Os seguintes blocos foram liberados no Unbound:\n\n${blocos_fmt}\nDeseja liberar os mesmos na porta 53 do iptables?" 18 60
-        if [[ $? -eq 0 ]]; then
-            for block in "${blocos_acl[@]}"; do
-                if [[ "$block" == *:* ]]; then
-                    ip6tables -A INPUT -p tcp -s "$block" --dport 53 -j ACCEPT
-                    ip6tables -A INPUT -p udp -s "$block" --dport 53 -j ACCEPT
-                else
-                    iptables -A INPUT -p tcp -s "$block" --dport 53 -j ACCEPT
-                    iptables -A INPUT -p udp -s "$block" --dport 53 -j ACCEPT
-                fi
-            done
-        else
-            while true; do
-                dns_src=$(whiptail --title "iptables - DNS porta 53" \
-                    --inputbox "Origem para porta 53 (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
-                    3>&1 1>&2 2>&3)
-                [[ $? -ne 0 || -z "$dns_src" ]] && break
-                if [[ "$dns_src" == *:* ]]; then
-                    ip6tables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
-                    ip6tables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
-                else
-                    iptables -A INPUT -p tcp -s "$dns_src" --dport 53 -j ACCEPT
-                    iptables -A INPUT -p udp -s "$dns_src" --dport 53 -j ACCEPT
-                fi
-            done
-        fi
-    fi
+    _ipt_liberar_dns rules_v4 rules_v6 0
 
     if systemctl is-active --quiet zabbix-agent2 2>/dev/null; then
-        zabbix_src=$(whiptail --title "iptables - Zabbix" \
-            --inputbox "Origem para porta 10050 do Zabbix (CIDR ou IP):" 10 60 \
-            3>&1 1>&2 2>&3)
-        if [[ $? -eq 0 && -n "$zabbix_src" ]]; then
-            if [[ "$zabbix_src" == *:* ]]; then
-                ip6tables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
-                ip6tables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
-            else
-                iptables -A INPUT -p tcp -s "$zabbix_src" --dport 10050 -j ACCEPT
-                iptables -A INPUT -p udp -s "$zabbix_src" --dport 10050 -j ACCEPT
-            fi
-        fi
+        _ipt_liberar_zabbix rules_v4 rules_v6
     fi
 
-    while true; do
-        porta_custom=$(whiptail --title "iptables - Porta Customizada" \
-            --inputbox "Porta adicional para liberar (deixe vazio para finalizar):" 8 60 \
-            3>&1 1>&2 2>&3)
-        [[ $? -ne 0 || -z "$porta_custom" ]] && break
-
-        whiptail --title "iptables - Porta $porta_custom" \
-            --yesno "Liberar porta $porta_custom para qualquer origem?" 8 55
-        if [[ $? -eq 0 ]]; then
-            for ipt in iptables ip6tables; do
-                $ipt -A INPUT -p tcp --dport "$porta_custom" -j ACCEPT
-                $ipt -A INPUT -p udp --dport "$porta_custom" -j ACCEPT
-            done
-        else
-            while true; do
-                custom_src=$(whiptail --title "iptables - Porta $porta_custom" \
-                    --inputbox "Origem para porta $porta_custom (CIDR ou IP)\nDeixe vazio para finalizar:" 10 60 \
-                    3>&1 1>&2 2>&3)
-                [[ $? -ne 0 || -z "$custom_src" ]] && break
-                if [[ "$custom_src" == *:* ]]; then
-                    ip6tables -A INPUT -p tcp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
-                    ip6tables -A INPUT -p udp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
-                else
-                    iptables -A INPUT -p tcp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
-                    iptables -A INPUT -p udp -s "$custom_src" --dport "$porta_custom" -j ACCEPT
-                fi
-            done
-        fi
-    done
+    _ipt_loop_custom_ports rules_v4 rules_v6
 
     if systemctl cat frr &>/dev/null; then
-        for ipt in iptables ip6tables; do
-            $ipt -A INPUT -p ospf -j ACCEPT
-            $ipt -A OUTPUT -p ospf -j ACCEPT
-        done
+        rules_v4+=("-A INPUT -p ospf -j ACCEPT" "-A OUTPUT -p ospf -j ACCEPT")
+        rules_v6+=("-A INPUT -p ospf -j ACCEPT" "-A OUTPUT -p ospf -j ACCEPT")
+    fi
+
+    if ! _aplicar_ruleset rules_v4 rules_v6; then
+        _hub_log ERROR "iptables_anycast: falha ao aplicar ruleset"
+        return 1
     fi
 
     netfilter-persistent save
-    whiptail --title "Concluido" --msgbox "Regras de iptables (IPv4 e IPv6) aplicadas e salvas." 8 55
+    _hub_log AUDIT "iptables_anycast: ruleset aplicado (${#rules_v4[@]} regras v4, ${#rules_v6[@]} regras v6)"
+    whiptail --title "Concluido" --msgbox "Regras de iptables (IPv4 e IPv6) aplicadas atomicamente e salvas." 8 65
 }
 
 fn_configurar_loopbacks() {
@@ -2020,25 +2169,7 @@ fn_coletar_dados_anycast() {
         3>&1 1>&2 2>&3)
     [[ $? -ne 0 ]] && outgoing_ipv6=""
 
-    declare -g -a acl_blocks=()
-    declare -g acl_redes_internas=0
-
-    whiptail --title "Unbound - ACL Redes Internas" \
-        --yesno "Deseja liberar automaticamente as redes privadas internas?\n\n  127.0.0.0/8\n  100.64.0.0/10\n  10.0.0.0/8\n  172.16.0.0/12\n  192.168.0.0/16\n  169.254.0.0/16\n  fc00::/7 (IPv6 ULA)" 20 60
-    acl_redes_internas=$?
-
-    whiptail --title "Unbound - ACL" --msgbox \
-"Informe os blocos CIDR adicionais permitidos para consulta DNS.
-Ex: 203.0.113.0/24, 2001:db8::/32
-Deixe vazio para finalizar." 10 65
-
-    while true; do
-        acl_block=$(whiptail --title "Unbound - ACL" \
-            --inputbox "Bloco permitido (CIDR)\n(deixe vazio para finalizar):" 10 60 \
-            3>&1 1>&2 2>&3)
-        [[ $? -ne 0 || -z "$acl_block" ]] && break
-        acl_blocks+=("$acl_block")
-    done
+    fn_coletar_acl
 
     zabbix_server_ip=$(whiptail --title "Zabbix - Servidor" \
         --inputbox "IP do Zabbix Server ou Proxy\n(pode alterar depois em /etc/zabbix/zabbix_agent2.conf):" 10 65 \
@@ -2195,7 +2326,7 @@ fn_configurar_unbound_anycast() {
     {
         echo "access-control: 127.0.0.0/8 allow"
         echo "access-control: ::1/128 allow"
-        if [[ $acl_redes_internas -eq 0 ]]; then
+        if [[ "${acl_redes_internas:-no}" == "yes" ]]; then
             echo "access-control: 100.64.0.0/10 allow"
             echo "access-control: 10.0.0.0/8 allow"
             echo "access-control: 172.16.0.0/12 allow"
@@ -2285,100 +2416,25 @@ EOF
 
     apt install -y sudo
 
-    cat > /etc/sudoers.d/zabbix-agent <<EOF
+    local sudoers_tmp
+    sudoers_tmp=$(mktemp)
+    cat > "$sudoers_tmp" <<EOF
 Defaults:zabbix !requiretty
 zabbix ALL = NOPASSWD: /usr/sbin/unbound-control
 EOF
-    chmod 0440 /etc/sudoers.d/zabbix-agent
 
-    if ! grep -q "unbound-control stats_noreset" /etc/sudoers; then
-        echo "zabbix ALL=(ALL) NOPASSWD: /usr/sbin/unbound-control stats_noreset" >> /etc/sudoers
+    if visudo -cf "$sudoers_tmp" >/dev/null 2>&1; then
+        install -m 0440 -o root -g root "$sudoers_tmp" /etc/sudoers.d/zabbix-agent
+    else
+        whiptail --title "Erro - sudoers" --msgbox "Falha na validacao do dropin sudoers. Regra NAO aplicada.\nArquivo temporario: $sudoers_tmp" 10 70
+        rm -f "$sudoers_tmp"
+        return 1
     fi
+    rm -f "$sudoers_tmp"
 
     usermod -a -G unbound zabbix
 
-    mkdir -p /etc/zabbix/zabbix_agent2.d
-    cat > /etc/zabbix/zabbix_agent2.d/userparameter_unbound.conf <<'EOF'
-UserParameter=unbound.service,systemctl is-active unbound >/dev/null 2>&1 && echo 1 || echo 0
-UserParameter=unbound.service.status,systemctl status unbound --no-pager -l 2>/dev/null | head -3 | tail -1 | awk '{print $2}' || echo "unknown"
-UserParameter=unbound.time.up,sudo /usr/sbin/unbound-control stats_noreset | grep "time.up=" | cut -d= -f2
-UserParameter=unbound.time.now,sudo /usr/sbin/unbound-control stats_noreset | grep "time.now=" | cut -d= -f2
-UserParameter=unbound.time.elapsed,sudo /usr/sbin/unbound-control stats_noreset | grep "time.elapsed=" | cut -d= -f2
-UserParameter=unbound.num.cachehits,sudo /usr/sbin/unbound-control stats_noreset | grep "num.cachehits=" | cut -d= -f2
-UserParameter=unbound.num.cachemiss,sudo /usr/sbin/unbound-control stats_noreset | grep "num.cachemiss=" | cut -d= -f2
-UserParameter=unbound.cache.hitrate,sudo /usr/sbin/unbound-control stats_noreset | awk '/num.cachehits=/{h=$2} /num.cachemiss=/{m=$2} END{total=h+m; if(total>0) printf "%.2f", (h/total)*100; else print 0}' FS='='
-UserParameter=unbound.cache.size,sudo /usr/sbin/unbound-control stats_noreset | grep "msg.cache.count=" | cut -d= -f2
-UserParameter=unbound.rrset.cache.size,sudo /usr/sbin/unbound-control stats_noreset | grep "rrset.cache.count=" | cut -d= -f2
-UserParameter=unbound.mem.total,sudo /usr/sbin/unbound-control stats_noreset | awk '/^mem\./{sum += $2} END{print sum}' FS='='
-UserParameter=unbound.mem[*],sudo /usr/sbin/unbound-control stats_noreset | grep "mem.$1=" | cut -d= -f2
-UserParameter=unbound.mem.cache,sudo /usr/sbin/unbound-control stats_noreset | grep "mem.cache.message=" | cut -d= -f2
-UserParameter=unbound.mem.cache.rrset,sudo /usr/sbin/unbound-control stats_noreset | grep "mem.cache.rrset=" | cut -d= -f2
-UserParameter=unbound.total[*],sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.$1=" | cut -d= -f2
-UserParameter=unbound.total.queries,sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.queries=" | cut -d= -f2
-UserParameter=unbound.total.cachehits,sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.cachehits=" | cut -d= -f2
-UserParameter=unbound.total.cachemiss,sudo /usr/sbin/unbound-control stats_noreset | grep "total.num.cachemiss=" | cut -d= -f2
-UserParameter=unbound.num.queries.sent,sudo /usr/sbin/unbound-control stats_noreset | grep "num.queries.sent=" | cut -d= -f2
-UserParameter=unbound.num.query.recurse,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.recurse=" | cut -d= -f2
-UserParameter=unbound.num.query.edns,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.edns=" | cut -d= -f2
-UserParameter=unbound.num.query.dnssec,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.dnssec=" | cut -d= -f2
-UserParameter=unbound.num.prefetch,sudo /usr/sbin/unbound-control stats_noreset | grep "num.prefetch=" | cut -d= -f2
-UserParameter=unbound.num.expired,sudo /usr/sbin/unbound-control stats_noreset | grep "num.expired=" | cut -d= -f2
-UserParameter=unbound.num.recursivereplies,sudo /usr/sbin/unbound-control stats_noreset | grep "num.recursivereplies=" | cut -d= -f2
-UserParameter=unbound.num.query.flagQR,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagQR=" | cut -d= -f2
-UserParameter=unbound.num.query.flagAA,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagAA=" | cut -d= -f2
-UserParameter=unbound.num.query.flagTC,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagTC=" | cut -d= -f2
-UserParameter=unbound.num.query.flagRD,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagRD=" | cut -d= -f2
-UserParameter=unbound.num.query.flagRA,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagRA=" | cut -d= -f2
-UserParameter=unbound.num.query.flagZ,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagZ=" | cut -d= -f2
-UserParameter=unbound.num.query.flagAD,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagAD=" | cut -d= -f2
-UserParameter=unbound.num.query.flagCD,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.flagCD=" | cut -d= -f2
-UserParameter=unbound.flag[*],sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.$1=" | cut -d= -f2
-UserParameter=unbound.type[*],echo -n 0; sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.$1=" | cut -d= -f2
-UserParameter=unbound.type.A,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.A=" | cut -d= -f2
-UserParameter=unbound.type.AAAA,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.AAAA=" | cut -d= -f2
-UserParameter=unbound.type.MX,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.MX=" | cut -d= -f2
-UserParameter=unbound.type.TXT,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.TXT=" | cut -d= -f2
-UserParameter=unbound.type.PTR,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.PTR=" | cut -d= -f2
-UserParameter=unbound.type.CNAME,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.CNAME=" | cut -d= -f2
-UserParameter=unbound.type.NS,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.NS=" | cut -d= -f2
-UserParameter=unbound.rcode[*],sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.$1=" | cut -d= -f2
-UserParameter=unbound.rcode.NOERROR,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.NOERROR=" | cut -d= -f2
-UserParameter=unbound.rcode.NXDOMAIN,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.NXDOMAIN=" | cut -d= -f2
-UserParameter=unbound.rcode.SERVFAIL,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.SERVFAIL=" | cut -d= -f2
-UserParameter=unbound.rcode.REFUSED,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode.REFUSED=" | cut -d= -f2
-UserParameter=unbound.class[*],sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.class.$1=" | cut -d= -f2
-UserParameter=unbound.class.IN,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.class.IN=" | cut -d= -f2
-UserParameter=unbound.histogram[*],sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.$1=" | cut -d= -f2
-UserParameter=unbound.histogram.custom[*],sudo /usr/sbin/unbound-control stats_noreset | awk -F= '/histogram.$1/{sub(/.ms total/, "", $1); print $2}'
-UserParameter=unbound.histogram.total[*],sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.$1=" | cut -d= -f2
-UserParameter=unbound.histogram.avg,sudo /usr/sbin/unbound-control stats_noreset | awk '/^histogram\./{split($1,a,"."); if(a[2]!="bucket") {time=a[2]; gsub("ms","",time); queries=$2; total_time+=time*queries; total_queries+=queries}} END{if(total_queries>0) printf "%.2f", total_time/total_queries; else print 0}' FS='='
-UserParameter=unbound.num.query.https,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.HTTPS=" | cut -d= -f2
-UserParameter=unbound.num.query.dnskey,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.DNSKEY=" | cut -d= -f2
-UserParameter=unbound.num.query.ds,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type.DS=" | cut -d= -f2
-UserParameter=unbound.num.answer.secure,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.secure=" | cut -d= -f2
-UserParameter=unbound.num.answer.bogus,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.bogus=" | cut -d= -f2
-UserParameter=unbound.thread[*],sudo /usr/sbin/unbound-control stats_noreset | grep "thread$1.num.queries=" | cut -d= -f2
-UserParameter=unbound.unwanted.queries,sudo /usr/sbin/unbound-control stats_noreset | grep "unwanted.queries=" | cut -d= -f2
-UserParameter=unbound.unwanted.replies,sudo /usr/sbin/unbound-control stats_noreset | grep "unwanted.replies=" | cut -d= -f2
-UserParameter=unbound.process.cpu,ps -C unbound -o pid,pcpu | grep -v PID | awk '{sum += $2} END{print sum}'
-UserParameter=unbound.process.memory,ps -C unbound -o pid,rss | grep -v PID | awk '{sum += $2} END{print sum*1024}'
-UserParameter=unbound.process.count,pgrep -c unbound
-UserParameter=unbound.discovery.types,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.type" | sed 's/num.query.type.//g' | cut -d= -f1 | awk '{print "{\"" $0 "\"}"}'
-UserParameter=unbound.discovery.rcodes,sudo /usr/sbin/unbound-control stats_noreset | grep "num.answer.rcode" | sed 's/num.answer.rcode.//g' | cut -d= -f1 | awk '{print "{\"" $0 "\"}"}'
-UserParameter=unbound.test.query,timeout 5 dig @127.0.0.1 google.com >/dev/null 2>&1 && echo 1 || echo 0
-UserParameter=unbound.test.response.time,timeout 5 dig @127.0.0.1 google.com | grep "Query time:" | awk '{print $4}' 2>/dev/null || echo 0
-UserParameter=unbound.efficiency,sudo /usr/sbin/unbound-control stats_noreset | awk "/total.num.cachehits=/{h=\$2} /total.num.queries=/{q=\$2} END{if(q>0) printf \"%.2f\", (h/q)*100; else print 0}" FS="="
-UserParameter=unbound.dns.status,systemctl is-active unbound >/dev/null 2>&1 && echo 1 || echo 0
-UserParameter=unbound.stats[*],sudo /usr/sbin/unbound-control stats_noreset | grep "^$1=" | cut -d= -f2
-UserParameter=unbound.qps.total,sudo /usr/sbin/unbound-control stats | grep "total.num.queries=" | cut -d= -f2 | awk '{print $1/60}'
-UserParameter=unbound.qps.cachehits,sudo /usr/sbin/unbound-control stats | grep "total.num.cachehits=" | cut -d= -f2 | awk '{print $1/60}'
-UserParameter=unbound.qps.type[*],sudo /usr/sbin/unbound-control stats | grep "num.query.type.$1=" | cut -d= -f2 | awk '{print $1/60}'
-UserParameter=unbound.histogram.0.016to0.032,sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.0000000.016000.032000.to.0000000.032000.064000=" | cut -d= -f2
-UserParameter=unbound.histogram.2.048to4.096,sudo /usr/sbin/unbound-control stats_noreset | grep "histogram.0000002.048000.000000.to.0000004.096000.000000=" | cut -d= -f2
-UserParameter=unbound.query.ipv6,sudo /usr/sbin/unbound-control stats_noreset | grep "num.query.ipv6=" | cut -d= -f2
-EOF
-
-    chmod 644 /etc/zabbix/zabbix_agent2.d/userparameter_unbound.conf
+    _escrever_userparameter_unbound
     systemctl enable --now zabbix-agent2
     systemctl restart zabbix-agent2
 
@@ -2486,26 +2542,29 @@ fn_verificar_bloqueio() {
             done <<< "$dominios_lista"
         fi
 
-        local total
+        local total _tbl
         total=$(echo "$dominios_lista" | grep -c .)
+        _tbl=$(mktemp)
 
-        clear
-        echo "======================================================"
-        echo " Busca por: $dominio"
-        echo " Total    : $total dominio(s) encontrado(s)"
-        echo "======================================================"
-        echo ""
-        printf "  %-45s %-12s %-15s %s\n" "DOMINIO" "ZONA" "IPv4" "IPv6"
-        echo "  ----------------------------------------------------------------------------"
-        while IFS= read -r d; do
-            local z i4 i6
-            z=$(echo "$resultado_grep"  | grep "local-zone:" | grep "\"$d\""  | awk '{print $NF}' | head -1)
-            i4=$(echo "$resultado_grep" | grep "local-data:" | grep "\"$d "   | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
-            i6=$(echo "$resultado_grep" | grep "AAAA"        | grep "\"$d "   | grep -oP '(?<=AAAA )[^"]+' | head -1)
-            printf "  %-45s %-12s %-15s %s\n" "$d" "${z:--}" "${i4:--}" "${i6:--}"
-        done <<< "$dominios_lista"
-        echo ""
-        read -rp "Pressione Enter para voltar ao menu..."
+        {
+            echo "======================================================"
+            echo " Busca por: $dominio"
+            echo " Total    : $total dominio(s) encontrado(s)"
+            echo "======================================================"
+            echo ""
+            printf "  %-45s %-12s %-15s %s\n" "DOMINIO" "ZONA" "IPv4" "IPv6"
+            echo "  ----------------------------------------------------------------------------"
+            while IFS= read -r d; do
+                local z i4 i6
+                z=$(echo "$resultado_grep"  | grep "local-zone:" | grep "\"$d\""  | awk '{print $NF}' | head -1)
+                i4=$(echo "$resultado_grep" | grep "local-data:" | grep "\"$d "   | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
+                i6=$(echo "$resultado_grep" | grep "AAAA"        | grep "\"$d "   | grep -oP '(?<=AAAA )[^"]+' | head -1)
+                printf "  %-45s %-12s %-15s %s\n" "$d" "${z:--}" "${i4:--}" "${i6:--}"
+            done <<< "$dominios_lista"
+        } > "$_tbl"
+
+        whiptail --title "$msg_titulo" --textbox "$_tbl" 30 90
+        rm -f "$_tbl"
         return 0
     fi
 
@@ -2667,58 +2726,135 @@ fn_benchmark_disco() {
     read -rp "Pressione Enter para voltar ao menu..."
 }
 
+_dispatch() {
+    local label="$1"; shift
+    _hub_log INFO "menu: $label"
+    "$@"
+    local rc=$?
+    _hub_log INFO "menu: $label (rc=$rc)"
+    return $rc
+}
+
+menu_dns() {
+    while true; do
+        choice=$(whiptail --title "DNS / Unbound" --cancel-button "Voltar" \
+            --menu "Selecione uma opcao:" 20 70 8 \
+            "1" "Instalar DNS Unbound Recursivo" \
+            "2" "Instalar DNS Unbound Reverso" \
+            "3" "Instalar DNS Recursivo Anycast" \
+            "4" "Instalar Monitor do Unbound" \
+            "5" "Teste DNS Unbound (IPv4 e IPv6)" \
+            "6" "Verificar Bloqueio de Dominio" \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && return 0
+        case "$choice" in
+            1) _dispatch "DNS Unbound Recursivo"   fn_instalar_recursivo ;;
+            2) _dispatch "DNS Unbound Reverso"     fn_reverso ;;
+            3) _dispatch "DNS Recursivo Anycast"   fn_anycast ;;
+            4) _dispatch "Monitor do Unbound"      fn_monitor_unbound ;;
+            5) _dispatch "Teste DNS Unbound"       fn_teste_dns ;;
+            6) _dispatch "Verificar Bloqueio"      fn_verificar_bloqueio ;;
+        esac
+    done
+}
+
+menu_monitoramento() {
+    while true; do
+        choice=$(whiptail --title "Monitoramento / Zabbix" --cancel-button "Voltar" \
+            --menu "Selecione uma opcao:" 18 70 6 \
+            "1" "Zabbix-Agent2 Padrao" \
+            "2" "Zabbix-Agent2 com Monitoramento Unbound" \
+            "3" "Configurar Usuario e Zabbix-Agent2 no PROXMOX" \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && return 0
+        case "$choice" in
+            1) _dispatch "Zabbix Agent2 Padrao"         fn_zabbix_comum ;;
+            2) _dispatch "Zabbix Agent2 + Unbound"      fn_zabbix_unbound ;;
+            3) _dispatch "Zabbix Agent2 no Proxmox"     fn_proxmox_zabbix ;;
+        esac
+    done
+}
+
+menu_firewall() {
+    while true; do
+        choice=$(whiptail --title "Firewall e Rede" --cancel-button "Voltar" \
+            --menu "Selecione uma opcao:" 16 70 4 \
+            "1" "Instalar e configurar iptables" \
+            "2" "Configurar Rota Default com Origem Publica" \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && return 0
+        case "$choice" in
+            1) _dispatch "iptables"           fn_iptables ;;
+            2) _dispatch "rota persistente"   fn_rota_persistente ;;
+        esac
+    done
+}
+
+menu_ferramentas() {
+    while true; do
+        choice=$(whiptail --title "Ferramentas" --cancel-button "Voltar" \
+            --menu "Selecione uma opcao:" 16 70 4 \
+            "1" "Instalar Krill e Routinator (RPKI)" \
+            "2" "Instalar Servidores de velocidade (Ookla, Nperf e MC)" \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && return 0
+        case "$choice" in
+            1) _dispatch "Krill/Routinator (RPKI)"   fn_rpki ;;
+            2) _dispatch "Servidores de velocidade"  fn_speedtest ;;
+        esac
+    done
+}
+
+menu_usuarios() {
+    _dispatch "Gerencia de Usuarios" fn_gerencia_usuarios
+}
+
+menu_diagnostico() {
+    while true; do
+        choice=$(whiptail --title "Diagnostico" --cancel-button "Voltar" \
+            --menu "Selecione uma opcao:" 20 70 8 \
+            "1" "Verificar Requisitos da Maquina" \
+            "2" "Captura de Pacotes (tcpdump)" \
+            "3" "SNMPwalk" \
+            "4" "Verificar Status dos Servicos" \
+            "5" "Verificar e Reiniciar Servicos" \
+            "6" "Benchmark de Disco (ioping / fio)" \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && return 0
+        case "$choice" in
+            1) _dispatch "Requisitos da Maquina"  fn_requisitos ;;
+            2) _dispatch "tcpdump"                fn_tcpdump ;;
+            3) _dispatch "SNMPwalk"               fn_snmpwalk ;;
+            4) _dispatch "Status dos Servicos"    fn_status_servicos ;;
+            5) _dispatch "Reiniciar Servicos"     fn_reiniciar_servico ;;
+            6) _dispatch "Benchmark de Disco"     fn_benchmark_disco ;;
+        esac
+    done
+}
+
 menu() {
     while true; do
-        choice=$(whiptail --title "Hub de Configuracoes" \
-            --menu "Selecione uma opcao:" 40 65 21 \
-            "1"  "Instalar DNS Unbound Recursivo" \
-            "2"  "Instalar DNS Unbound Reverso" \
-            "3"  "Instalar DNS Recursivo Anycast" \
-            "4"  "Instalar Monitor do Unbound" \
-            "5"  "Teste DNS Unbound (IPv4 e IPv6)" \
-            "6"  "Instalar Krill e Routinator (RPKI)" \
-            "7"  "Instalar Servidores de velocidade (Ookla, Nperf e MC)" \
-            "8"  "Instalar Zabbix-Agent2 Padrao" \
-            "9"  "Instalar Zabbix-Agent2 com Monitoramento Unbound" \
-            "10" "Configurar Usuario e Zabbix-Agent2 no PROXMOX" \
-            "11" "Instalar e configurar iptables" \
-            "12" "Configurar Rota Default com Origem Publica" \
-            "13" "Gerencia de Usuarios" \
-            "14" "Verificar Requisitos da Maquina" \
-            "15" "Captura de Pacotes (tcpdump)" \
-            "16" "SNMPwalk" \
-            "17" "Verificar Status dos Servicos" \
-            "18" "Verificar e Reiniciar Servicos" \
-            "19" "Verificar Bloqueio de Dominio" \
-            "20" "Benchmark de Disco (ioping / fio)" \
-            "21" "Sair" \
+        choice=$(whiptail --title "Hub de Configuracoes" --cancel-button "Sair" \
+            --menu "Selecione uma categoria:" 18 65 7 \
+            "1" "DNS / Unbound" \
+            "2" "Monitoramento / Zabbix" \
+            "3" "Firewall e Rede" \
+            "4" "Ferramentas (RPKI, Velocidade)" \
+            "5" "Gerencia de Usuarios" \
+            "6" "Diagnostico" \
+            "7" "Sair" \
             3>&1 1>&2 2>&3)
 
-        exitstatus=$?
-        [[ $exitstatus -ne 0 ]] && exit 0
+        [[ $? -ne 0 ]] && { _hub_log INFO "script encerrado pelo usuario"; exit 0; }
 
         case "$choice" in
-            1)  fn_instalar_recursivo ;;
-            2)  fn_reverso ;;
-            3)  fn_anycast ;;
-            4)  fn_monitor_unbound ;;
-            5)  fn_teste_dns ;;
-            6)  fn_rpki ;;
-            7)  fn_speedtest ;;
-            8)  fn_zabbix_comum ;;
-            9)  fn_zabbix_unbound ;;
-            10) fn_proxmox_zabbix ;;
-            11) fn_iptables ;;
-            12) fn_rota_persistente ;;
-            13) fn_gerencia_usuarios ;;
-            14) fn_requisitos ;;
-            15) fn_tcpdump ;;
-            16) fn_snmpwalk ;;
-            17) fn_status_servicos ;;
-            18) fn_reiniciar_servico ;;
-            19) fn_verificar_bloqueio ;;
-            20) fn_benchmark_disco ;;
-            21) exit 0 ;;
+            1) menu_dns ;;
+            2) menu_monitoramento ;;
+            3) menu_firewall ;;
+            4) menu_ferramentas ;;
+            5) menu_usuarios ;;
+            6) menu_diagnostico ;;
+            7) _hub_log INFO "script encerrado pelo usuario"; exit 0 ;;
         esac
     done
 }
