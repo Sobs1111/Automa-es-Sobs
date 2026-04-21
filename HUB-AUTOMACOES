@@ -41,6 +41,7 @@ declare -g -a ipv4_list=()
 declare -g -a ipv6_list=()
 
 readonly HUB_LOG_FILE="/var/log/hub-automacoes.log"
+readonly HUB_CRED_DIR="/etc/hub-automacoes/credentials"
 
 _hub_log() {
     local level="$1"; shift
@@ -2726,6 +2727,370 @@ fn_benchmark_disco() {
     read -rp "Pressione Enter para voltar ao menu..."
 }
 
+_huawei_cred_dir() {
+    local dir="$HUB_CRED_DIR/huawei"
+    mkdir -p "$dir" 2>/dev/null
+    chmod 700 "$HUB_CRED_DIR" 2>/dev/null
+    chmod 700 "$dir" 2>/dev/null
+    printf '%s\n' "$dir"
+}
+
+_huawei_cred_load() {
+    local file="$1" key val
+    host=""; porta=""; user=""; senha=""
+    while IFS='=' read -r key val; do
+        case "$key" in
+            HOST)  host="$val" ;;
+            PORTA) porta="$val" ;;
+            USER)  user="$val" ;;
+            SENHA) senha="$val" ;;
+        esac
+    done < "$file"
+    [[ -n "$host" && -n "$porta" && -n "$user" && -n "$senha" ]]
+}
+
+_huawei_cred_save() {
+    local dir="$1" label="$2" host="$3" porta="$4" user="$5" senha="$6"
+    local file="$dir/${label}.cred"
+    {
+        printf 'HOST=%s\n'  "$host"
+        printf 'PORTA=%s\n' "$porta"
+        printf 'USER=%s\n'  "$user"
+        printf 'SENHA=%s\n' "$senha"
+    } > "$file"
+    chmod 600 "$file" 2>/dev/null
+}
+
+fn_huawei_bgp() {
+    if ! command -v sshpass >/dev/null 2>&1; then
+        echo "Instalando sshpass..."
+        apt update -qq && apt install -y sshpass || {
+            whiptail --title "Erro" --msgbox "Falha ao instalar sshpass." 8 50
+            return 1
+        }
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Instalando python3..."
+        apt update -qq && apt install -y python3 || {
+            whiptail --title "Erro" --msgbox "Falha ao instalar python3." 8 50
+            return 1
+        }
+    fi
+
+    local cred_dir
+    cred_dir=$(_huawei_cred_dir)
+
+    local host="" porta="" user="" senha=""
+    local usou_salva="no" label_atual=""
+
+    local saved=()
+    if [[ -d "$cred_dir" ]]; then
+        while IFS= read -r -d '' f; do
+            saved+=("$f")
+        done < <(find "$cred_dir" -maxdepth 1 -type f -name '*.cred' -print0 2>/dev/null | sort -z)
+    fi
+
+    if (( ${#saved[@]} > 0 )); then
+        local menu_opts=() i=1 lbl
+        for f in "${saved[@]}"; do
+            lbl=$(basename "$f" .cred)
+            menu_opts+=("$i" "$lbl")
+            ((i++))
+        done
+        menu_opts+=("N" "Digitar novas credenciais")
+
+        local escolha
+        escolha=$(whiptail --title "Huawei BGP - Credenciais Salvas" \
+            --menu "Existem credenciais salvas em $cred_dir.\nSelecione qual usar:" \
+            18 70 10 \
+            "${menu_opts[@]}" \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && return 1
+
+        if [[ "$escolha" != "N" ]]; then
+            local idx=$((escolha - 1))
+            local f="${saved[$idx]}"
+            if _huawei_cred_load "$f"; then
+                usou_salva="yes"
+                label_atual=$(basename "$f" .cred)
+            else
+                whiptail --title "Erro" --msgbox "Arquivo de credencial invalido:\n$f" 10 60
+                return 1
+            fi
+        fi
+    fi
+
+    if [[ "$usou_salva" != "yes" ]]; then
+        host=$(whiptail --title "Huawei BGP - Host" \
+            --inputbox "IP ou hostname do equipamento Huawei:" 8 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$host" ]] && return 1
+
+        porta=$(whiptail --title "Huawei BGP - Porta" \
+            --inputbox "Porta SSH:" 8 60 "22" \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$porta" ]] && return 1
+
+        user=$(whiptail --title "Huawei BGP - Usuario" \
+            --inputbox "Usuario SSH:" 8 60 "admin" \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$user" ]] && return 1
+
+        senha=$(whiptail --title "Huawei BGP - Senha" \
+            --passwordbox "Senha SSH para $user@$host:" 8 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$senha" ]] && return 1
+
+        if whiptail --title "Salvar credencial?" \
+            --yesno "Deseja salvar estas credenciais para uso futuro?\n\nLocal: $cred_dir\nPermissoes: 0600 (somente root)" \
+            12 70; then
+            local label=""
+            while true; do
+                label=$(whiptail --title "Salvar credencial - Rotulo" \
+                    --inputbox "Nome (rotulo) para identificar esta credencial.\nUse apenas letras, numeros, '_' ou '-'." \
+                    10 70 "$host" \
+                    3>&1 1>&2 2>&3)
+                [[ $? -ne 0 ]] && break
+                if [[ -z "$label" || ! "$label" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    whiptail --title "Rotulo invalido" --msgbox \
+                        "Use apenas letras, numeros, '_' e '-'." 8 50
+                    continue
+                fi
+                if [[ -e "$cred_dir/${label}.cred" ]]; then
+                    if ! whiptail --title "Sobrescrever?" \
+                        --yesno "Ja existe credencial com rotulo '$label'.\nSobrescrever?" 10 60; then
+                        continue
+                    fi
+                fi
+                _huawei_cred_save "$cred_dir" "$label" "$host" "$porta" "$user" "$senha"
+                label_atual="$label"
+                break
+            done
+        fi
+    fi
+
+    clear
+    echo "======================================================"
+    echo "Consultando BGP em $user@$host:$porta"
+    [[ -n "$label_atual" ]] && echo "Credencial: $label_atual"
+    echo "Comandos: display ip interface brief / display ipv6 interface brief / display bgp all summary"
+    echo "======================================================"
+    echo ""
+
+    local tmp_out
+    tmp_out=$(mktemp /tmp/hub_bgp.XXXXXX 2>/dev/null) || tmp_out="/tmp/hub_bgp_$$.out"
+
+    SSHPASS="$senha" sshpass -e ssh \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -o ConnectTimeout=15 \
+        -o KexAlgorithms=+diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1 \
+        -o HostKeyAlgorithms=+ssh-rsa \
+        -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+        -o PubkeyAuthentication=no \
+        -o Ciphers=+aes128-cbc \
+        -p "$porta" "$user@$host" >"$tmp_out" 2>&1 <<'EOF'
+screen-length 0 temporary
+display ip interface brief
+display ipv6 interface brief
+display bgp all summary
+quit
+EOF
+    local rc=$?
+
+    local parsed
+    parsed=$(python3 - "$tmp_out" <<'PYEOF'
+import sys, re, ipaddress
+
+try:
+    with open(sys.argv[1], errors='replace') as f:
+        text = f.read()
+except Exception:
+    sys.exit(0)
+
+def extract_block(text, cmd):
+    pat = re.compile(r'(?:^|\n)[^\n]*>' + re.escape(cmd) + r'\s*\n')
+    m = pat.search(text)
+    if not m:
+        return ''
+    rest = text[m.end():]
+    em = re.search(r'\n<[^>]+>', rest)
+    return rest[:em.start()] if em else rest
+
+ifb4 = extract_block(text, 'display ip interface brief')
+ifb6 = extract_block(text, 'display ipv6 interface brief')
+bgp  = extract_block(text, 'display bgp all summary')
+
+def norm_phy(ph):
+    if not ph:
+        return '-'
+    p = ph.lower().lstrip('*^!')
+    if p == 'up':
+        return 'UP'
+    if p.startswith('down'):
+        return 'DOWN'
+    return ph.upper()
+
+interfaces_v4 = []
+for line in ifb4.splitlines():
+    if not line.strip():
+        continue
+    parts = line.split()
+    if len(parts) < 4:
+        continue
+    if parts[0] in ('Interface', 'The'):
+        continue
+    if parts[0].startswith(('*', '^', '(')):
+        continue
+    name, ipmask = parts[0], parts[1]
+    if ipmask.lower() == 'unassigned':
+        continue
+    physical = parts[2] if len(parts) >= 3 else ''
+    vpn = parts[4] if len(parts) >= 5 else ''
+    try:
+        net = ipaddress.ip_network(ipmask, strict=False)
+        if net.version != 4:
+            continue
+    except ValueError:
+        continue
+    interfaces_v4.append((name, net, vpn, physical))
+
+interfaces_v6 = []
+current_iface = None
+current_phy = ''
+for line in ifb6.splitlines():
+    stripped = line.strip()
+    if not stripped:
+        continue
+    if stripped.startswith(('*', '^', '!', '(')):
+        continue
+    if stripped.startswith('Interface') and 'Physical' in stripped:
+        continue
+    if stripped.startswith('The number of'):
+        continue
+    m = re.match(r'\[IPv6 Address[^\]]*\]\s+(\S+)', stripped)
+    if m and current_iface:
+        try:
+            net = ipaddress.ip_network(m.group(1), strict=False)
+            if net.version == 6:
+                interfaces_v6.append((current_iface, net, current_phy))
+        except ValueError:
+            pass
+        continue
+    parts = stripped.split()
+    if parts and re.match(r'^[A-Za-z0-9][\w/.\-:]*$', parts[0]):
+        current_iface = parts[0]
+        current_phy = parts[1] if len(parts) >= 2 else ''
+
+peers = []
+family = None
+vpn = None
+for line in bgp.splitlines():
+    if 'Peer of IPv4-family for vpn instance' in line:
+        family = 'IPv4'; continue
+    if 'Peer of IPv6-family for vpn instance' in line:
+        family = 'IPv6'; continue
+    if 'Peer of IPv4-family for public' in line:
+        family = 'IPv4'; vpn = '_public_'; continue
+    if 'Peer of IPv6-family for public' in line:
+        family = 'IPv6'; vpn = '_public_'; continue
+    m = re.match(r'\s*VPN-Instance\s+(\S+?),', line)
+    if m:
+        vpn = m.group(1); continue
+    if 'Address Family' in line:
+        family = None; vpn = None; continue
+    if family is None:
+        continue
+    stripped = line.strip()
+    if not stripped:
+        continue
+    if stripped.startswith('Peer') and 'AS' in stripped:
+        continue
+    if stripped.startswith('-') or stripped.startswith('Total number of peers'):
+        continue
+    parts = stripped.split()
+    if not parts or len(parts) < 9:
+        continue
+    try:
+        if family == 'IPv4':
+            ipaddress.IPv4Address(parts[0])
+        else:
+            ipaddress.IPv6Address(parts[0])
+    except ValueError:
+        continue
+    state = parts[6] if len(parts) == 9 else ' '.join(parts[6:-2])
+    peers.append((family, vpn, parts[0], state))
+
+def find_iface(family, vpn, peer):
+    try:
+        ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return ('-', '-')
+    if family == 'IPv4':
+        same = [(n, ph) for n, net, v, ph in interfaces_v4 if ip in net and vpn and v == vpn]
+        if same:
+            return (same[0][0], norm_phy(same[0][1]))
+        anym = [(n, ph) for n, net, v, ph in interfaces_v4 if ip in net]
+        if anym:
+            return (anym[0][0], norm_phy(anym[0][1]))
+        return ('-', '-')
+    matches = [(n, ph) for n, net, ph in interfaces_v6 if ip in net]
+    if matches:
+        return (matches[0][0], norm_phy(matches[0][1]))
+    return ('-', '-')
+
+for family, vpn, peer, state in peers:
+    iface, status = find_iface(family, vpn, peer)
+    print(f'{family}|{peer}|{state}|{iface}|{status}')
+PYEOF
+)
+
+    echo "--------------------------------------------------------------------------------------------------------"
+    if [[ -n "$parsed" ]]; then
+        printf '%-6s %-40s %-14s %-26s %s\n' "TIPO" "PEER" "ESTADO" "INTERFACE" "STATUS"
+        printf -- '------ ---------------------------------------- -------------- -------------------------- ------\n'
+        while IFS='|' read -r tipo peer estado iface status; do
+            printf '%-6s %-40s %-14s %-26s %s\n' "$tipo" "$peer" "$estado" "$iface" "$status"
+        done <<< "$parsed"
+
+        local total total_v4 total_v6 total_est total_no_iface total_down
+        total=$(printf '%s\n' "$parsed" | wc -l)
+        total_v4=$(printf '%s\n' "$parsed" | grep -c '^IPv4|')
+        total_v6=$(printf '%s\n' "$parsed" | grep -c '^IPv6|')
+        total_est=$(printf '%s\n' "$parsed" | grep -c '|Established|')
+        total_no_iface=$(printf '%s\n' "$parsed" | grep -c '|-|-$')
+        total_down=$(printf '%s\n' "$parsed" | grep -c '|DOWN$')
+        echo "--------------------------------------------------------------------------------------------------------"
+        echo "Resumo: $total peers ($total_v4 IPv4 / $total_v6 IPv6) | $total_est em Established"
+        if (( total_down > 0 )); then
+            echo "Obs: $total_down peer(s) com interface DOWN."
+        fi
+        if (( total_no_iface > 0 )); then
+            echo "Obs: $total_no_iface peer(s) sem interface direta (possivel iBGP via loopback)."
+        fi
+    else
+        echo "Nao foi possivel extrair peers. Saida bruta:"
+        echo ""
+        cat "$tmp_out"
+    fi
+
+    rm -f "$tmp_out"
+
+    echo ""
+    echo "======================================================"
+    if [[ -n "$parsed" ]]; then
+        echo "Consulta concluida."
+    elif [[ $rc -eq 0 ]]; then
+        echo "Consulta finalizada com sucesso, mas sem peers identificados."
+    else
+        echo "Consulta falhou (rc=$rc). Verifique credenciais/conectividade."
+    fi
+    echo "======================================================"
+    read -rp "Pressione Enter para voltar ao menu..."
+}
+
 _dispatch() {
     local label="$1"; shift
     _hub_log INFO "menu: $label"
@@ -2819,6 +3184,7 @@ menu_diagnostico() {
             "4" "Verificar Status dos Servicos" \
             "5" "Verificar e Reiniciar Servicos" \
             "6" "Benchmark de Disco (ioping / fio)" \
+            "7" "Consultar BGP Huawei (SSH)" \
             3>&1 1>&2 2>&3)
         [[ $? -ne 0 ]] && return 0
         case "$choice" in
@@ -2828,6 +3194,7 @@ menu_diagnostico() {
             4) _dispatch "Status dos Servicos"    fn_status_servicos ;;
             5) _dispatch "Reiniciar Servicos"     fn_reiniciar_servico ;;
             6) _dispatch "Benchmark de Disco"     fn_benchmark_disco ;;
+            7) _dispatch "BGP Huawei"             fn_huawei_bgp ;;
         esac
     done
 }
