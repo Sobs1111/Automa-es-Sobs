@@ -219,6 +219,54 @@ gerar_config_unbound() {
     } > "$config_file"
 }
 
+gerar_config_unbound_reverso() {
+    local outgoing_ip="$1"
+    config_file="/etc/unbound/unbound.conf.d/server.conf"
+    {
+        echo "server:"
+        echo "    use-syslog: yes"
+        echo "    username: \"unbound\""
+        echo "    directory: \"/etc/unbound\""
+        echo "    do-ip6: yes"
+        echo "    do-ip4: yes"
+        for ip in "${ipv4_list[@]}"; do echo "    interface: $ip"; done
+        for ip in "${ipv6_list[@]}"; do echo "    interface: $ip"; done
+        echo "    verbosity: 0"
+        echo "    port: 53"
+        echo "    log-replies: no"
+        echo "    root-hints: /usr/share/dns/root.hints"
+        echo "    harden-dnssec-stripped: yes"
+        echo "    extended-statistics: yes"
+        echo "    statistics-cumulative: no"
+        echo "    include: /etc/unbound/local_zone.conf"
+        echo "    include: /etc/unbound/blacklist.conf"
+        echo "    include: /etc/unbound/acl.conf"
+        echo "    num-threads: 2"
+        echo "    msg-cache-slabs: 2"
+        echo "    rrset-cache-slabs: 2"
+        echo "    infra-cache-slabs: 2"
+        echo "    key-cache-slabs: 2"
+        echo "    rrset-cache-size: 16m"
+        echo "    msg-cache-size: 8m"
+        echo "    outgoing-range: 512"
+        echo "    so-rcvbuf: 1m"
+        echo "    so-sndbuf: 1m"
+        echo "    so-reuseport: yes"
+        echo "    prefetch: yes"
+        echo "    prefetch-key: yes"
+        echo "    hide-identity: yes"
+        echo "    hide-version: yes"
+        echo "    unwanted-reply-threshold: 10000000"
+        echo "    deny-any: yes"
+        echo "    num-queries-per-thread: 512"
+        echo "    outgoing-num-tcp: 64"
+        echo "    incoming-num-tcp: 128"
+        echo "    minimal-responses: yes"
+        echo "    edns-buffer-size: 1232"
+        [[ -n "$outgoing_ip" ]] && echo "    outgoing-interface: $outgoing_ip"
+    } > "$config_file"
+}
+
 aplicar_sysctl() {
     cat > /etc/sysctl.d/99-unbound.conf <<EOF
 net.core.rmem_max = 134217728
@@ -385,8 +433,7 @@ fn_reverso() {
         fi
 
         instalar_unbound_base
-        detectar_tier
-        gerar_config_unbound "$outgoing_ip"
+        gerar_config_unbound_reverso "$outgoing_ip"
         aplicar_sysctl
     else
         detectar_ips
