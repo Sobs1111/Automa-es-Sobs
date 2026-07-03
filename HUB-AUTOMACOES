@@ -1956,7 +1956,8 @@ EOF
 fn_teste_dns() {
     which dig &>/dev/null || apt-get install -y dnsutils
 
-    local dns_server="localhost"
+    local dns_server_v4="127.0.0.1"
+    local dns_server_v6="::1"
 
     local tipo
     tipo=$(whiptail --title "Teste DNS Unbound" \
@@ -2026,9 +2027,10 @@ fn_teste_dns() {
                 unbound-control flush_zone "$domain" 2>/dev/null
             fi
 
-            local out4
-            out4=$(dig @"$dns_server" A "$domain" +noall +answer +time=3 +tries=1 2>/dev/null)
-            if [[ -z "$out4" ]]; then
+            local out4 rc4
+            out4=$(dig -4 @"$dns_server_v4" A "$domain" +noall +answer +time=3 +tries=1 2>&1)
+            rc4=$?
+            if [[ $rc4 -ne 0 || -z "$out4" || "$out4" == *"communications error"* || "$out4" == *"connection refused"* || "$out4" == *"network unreachable"* || "$out4" == *";;"* ]]; then
                 echo "  IPv4: FALHA"
                 ((ipv4_fail++))
             else
@@ -2037,9 +2039,10 @@ fn_teste_dns() {
                 ((ipv4_ok++))
             fi
 
-            local out6
-            out6=$(dig @"$dns_server" AAAA "$domain" +noall +answer +time=3 +tries=1 2>/dev/null)
-            if [[ -z "$out6" ]]; then
+            local out6 rc6
+            out6=$(dig -6 @"$dns_server_v6" AAAA "$domain" +noall +answer +time=3 +tries=1 2>&1)
+            rc6=$?
+            if [[ $rc6 -ne 0 || -z "$out6" || "$out6" == *"communications error"* || "$out6" == *"connection refused"* || "$out6" == *"network unreachable"* || "$out6" == *";;"* ]]; then
                 echo "  IPv6: FALHA"
                 ((ipv6_fail++))
             else
