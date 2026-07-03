@@ -169,11 +169,92 @@ EOF
 
     touch /etc/unbound/blacklist.conf
     touch /etc/unbound/local_zone.conf
+
+    cat > /etc/unbound/unbound.conf.d/statistics-enable.conf <<'EOF'
+server:
+    statistics-interval: 0
+    statistics-cumulative: no
+    extended-statistics: yes
+
+remote-control:
+    control-enable: yes
+    control-interface: 127.0.0.1
+    control-port: 8953
+    server-key-file: "/etc/unbound/unbound_server.key"
+    server-cert-file: "/etc/unbound/unbound_server.pem"
+    control-key-file: "/etc/unbound/unbound_control.key"
+    control-cert-file: "/etc/unbound/unbound_control.pem"
+EOF
+
+    unbound-control-setup >/dev/null 2>&1 || true
 }
 
 gerar_config_unbound() {
     local outgoing_ip="$1"
     config_file="/etc/unbound/unbound.conf.d/server.conf"
+
+    if [[ "${tier:-}" == "alto" ]]; then
+        mkdir -p /var/log/unbound
+        touch /var/log/unbound/unbound.log
+        chown -R unbound:unbound /var/log/unbound/
+
+        {
+            echo "server:"
+            echo "    verbosity: 1"
+            echo "    statistics-interval: 0"
+            echo "    statistics-cumulative: no"
+            echo "    extended-statistics: yes"
+            echo "    num-threads: $t_threads"
+            echo "    serve-expired: yes"
+            for ip in "${ipv4_list[@]}"; do echo "    interface: $ip"; done
+            for ip in "${ipv6_list[@]}"; do echo "    interface: $ip"; done
+            echo "    interface-automatic: no"
+            [[ -n "$outgoing_ip" ]] && echo "    outgoing-interface: $outgoing_ip"
+            echo "    outgoing-range: $t_range"
+            echo "    outgoing-num-tcp: $t_otcp"
+            echo "    incoming-num-tcp: $t_itcp"
+            echo "    so-rcvbuf: 8m"
+            echo "    so-sndbuf: 8m"
+            echo "    so-reuseport: yes"
+            echo "    edns-buffer-size: 1232"
+            echo "    msg-cache-size: $t_msg"
+            echo "    msg-cache-slabs: $t_slabs"
+            echo "    num-queries-per-thread: $t_qpt"
+            echo "    rrset-cache-size: $t_rrset"
+            echo "    rrset-cache-slabs: $t_slabs"
+            echo "    infra-cache-slabs: $t_slabs"
+            echo "    key-cache-slabs: $t_slabs"
+            echo "    do-ip4: yes"
+            echo "    do-ip6: yes"
+            echo "    do-udp: yes"
+            echo "    do-tcp: yes"
+            echo "    chroot: \"\""
+            echo "    username: \"unbound\""
+            echo "    directory: \"/etc/unbound\""
+            echo "    logfile: \"/var/log/unbound/unbound.log\""
+            echo "    use-syslog: no"
+            echo "    log-time-ascii: yes"
+            echo "    log-queries: no"
+            echo "    pidfile: \"/var/run/unbound.pid\""
+            echo "    root-hints: \"/usr/share/dns/root.hints\""
+            echo "    hide-identity: yes"
+            echo "    hide-version: yes"
+            echo "    unwanted-reply-threshold: 10000000"
+            echo "    prefetch: yes"
+            echo "    prefetch-key: yes"
+            echo "    rrset-roundrobin: yes"
+            echo "    minimal-responses: yes"
+            echo "    module-config: \"respip validator iterator\""
+            echo "    val-clean-additional: yes"
+            echo "    val-log-level: 1"
+            echo "    deny-any: yes"
+            echo "    include: /etc/unbound/local_zone.conf"
+            echo "    include: /etc/unbound/blacklist.conf"
+            echo "    include: /etc/unbound/acl.conf"
+        } > "$config_file"
+        return
+    fi
+
     {
         echo "server:"
         echo "    use-syslog: yes"
