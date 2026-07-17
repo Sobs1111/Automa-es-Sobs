@@ -1280,6 +1280,12 @@ Routinator
 }
 
 fn_rota_persistente() {
+    whiptail --title "Rota Persistente - Loopback" \
+        --yesno "Deseja configurar a loopback com o IP publico /32 antes de setar a rota?" 8 65
+    if [[ $? -eq 0 ]]; then
+        fn_configurar_loopbacks
+    fi
+
     mapfile -t interfaces < <(ip link show | awk -F': ' '/^[0-9]+: / && !/lo/ {print $2}' | awk '{print $1}')
 
     local iface_opts=()
@@ -3277,11 +3283,13 @@ menu_firewall() {
             --menu "Selecione uma opcao:" 16 70 4 \
             "1" "Instalar e configurar iptables" \
             "2" "Configurar Rota Default com Origem Publica" \
+            "3" "Configurar Loopback com IP Publico (/32)" \
             3>&1 1>&2 2>&3)
         [[ $? -ne 0 ]] && return 0
         case "$choice" in
             1) _dispatch "iptables"           fn_iptables ;;
             2) _dispatch "rota persistente"   fn_rota_persistente ;;
+            3) _dispatch "loopback ip publico" fn_configurar_loopbacks ;;
         esac
     done
 }
