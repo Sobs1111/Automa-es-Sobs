@@ -237,6 +237,7 @@ gerar_config_unbound() {
             echo "    log-queries: no"
             echo "    pidfile: \"/var/run/unbound.pid\""
             echo "    root-hints: \"/usr/share/dns/root.hints\""
+            echo "    auto-trust-anchor-file: \"/var/lib/unbound/root.key\""
             echo "    hide-identity: yes"
             echo "    hide-version: yes"
             echo "    unwanted-reply-threshold: 10000000"
@@ -268,6 +269,7 @@ gerar_config_unbound() {
         echo "    port: 53"
         echo "    log-replies: no"
         echo "    root-hints: /usr/share/dns/root.hints"
+        echo "    auto-trust-anchor-file: \"/var/lib/unbound/root.key\""
         echo "    harden-dnssec-stripped: yes"
         echo "    extended-statistics: yes"
         echo "    statistics-cumulative: no"
@@ -483,6 +485,9 @@ fn_instalar_recursivo() {
     fi
 
     instalar_unbound_base
+    mkdir -p /var/lib/unbound
+    unbound-anchor -a /var/lib/unbound/root.key || true
+    chown unbound:unbound /var/lib/unbound/root.key
     detectar_tier
     gerar_config_unbound "$outgoing_ip"
     aplicar_sysctl
@@ -496,7 +501,6 @@ fn_reverso() {
     if ! systemctl is-active --quiet unbound 2>/dev/null; then
         whiptail --title "Aviso" --msgbox "Unbound nao detectado. Sera executada a instalacao base antes de configurar a zona reversa." 10 60
         confirmar_ips || return
-        fn_coletar_acl
 
         outgoing_ip=""
         default_gw=$(ip route show default | awk '/default via/ {print $3; exit}')
@@ -519,6 +523,11 @@ fn_reverso() {
     else
         detectar_ips
     fi
+
+    {
+        echo "access-control: ::/0 refuse_non_local"
+        echo "access-control: 0.0.0.0/0 refuse_non_local"
+    } > /etc/unbound/acl.conf
 
     fn_monitor_unbound_silencioso
     whiptail --title "Aviso" --msgbox "Servico de monitoramento do Unbound instalado automaticamente." 8 60
@@ -2395,6 +2404,10 @@ fn_instalar_unbound_anycast() {
     touch /var/log/unbound/unbound.log
     chown -R unbound:unbound /var/log/unbound/
 
+    mkdir -p /var/lib/unbound
+    unbound-anchor -a /var/lib/unbound/root.key || true
+    chown unbound:unbound /var/lib/unbound/root.key
+
     cat > /etc/unbound/unbound.conf <<EOF
 include: "/etc/unbound/unbound.conf.d/*.conf"
 EOF
@@ -2445,6 +2458,7 @@ fn_configurar_unbound_anycast() {
         echo "    log-queries: no"
         echo "    pidfile: \"/var/run/unbound.pid\""
         echo "    root-hints: \"/usr/share/dns/root.hints\""
+        echo "    auto-trust-anchor-file: \"/var/lib/unbound/root.key\""
         echo "    hide-identity: yes"
         echo "    hide-version: yes"
         echo "    unwanted-reply-threshold: 10000000"
