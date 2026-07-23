@@ -712,8 +712,8 @@ fn_reverso() {
                     current_24="$this_24"
                 fi
 
-                if [[ -n "${special_ips[$current_ip]}" ]]; then
-                    hostname="${special_ips[$current_ip]}"
+                if [[ -n "${special_ips[$current_ip]:-}" ]]; then
+                    hostname="${special_ips[$current_ip]:-}"
                 else
                     hostname="${a}-${b}-${c}-${d}.${domain}"
                 fi
