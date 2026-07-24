@@ -980,6 +980,105 @@ fn_iptables() {
     whiptail --title "Concluido" --msgbox "Regras de iptables (IPv4 e IPv6) aplicadas atomicamente e salvas." 8 65
 }
 
+fn_iptables_adicionar() {
+    if ! command -v iptables >/dev/null 2>&1; then
+        whiptail --title "iptables" \
+            --msgbox "iptables nao esta instalado.\nUse a opcao 'Instalar e configurar iptables' primeiro." 9 65
+        return 1
+    fi
+
+    if ! iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP'; then
+        whiptail --title "iptables - Aviso" \
+            --yesno "A politica padrao da chain INPUT nao esta como DROP.\n\nIsso indica que o firewall base pode nao ter sido criado por este Hub. Adicionar regras ACCEPT so tem efeito util quando a politica padrao e DROP.\n\nDeseja continuar mesmo assim?" 14 70
+        [[ $? -ne 0 ]] && return 0
+    fi
+
+    declare -a rules_v4=()
+    declare -a rules_v6=()
+
+    while true; do
+        local porta
+        porta=$(whiptail --title "iptables - Adicionar Regra" \
+            --inputbox "Porta a liberar (deixe vazio para finalizar):" 8 60 \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 || -z "$porta" ]] && break
+        if ! [[ "$porta" =~ ^[0-9]+$ ]] || (( porta < 1 || porta > 65535 )); then
+            whiptail --title "Erro" --msgbox "Porta invalida: '$porta'." 8 50
+            continue
+        fi
+
+        local proto_sel
+        proto_sel=$(whiptail --title "iptables - Protocolo" \
+            --menu "Protocolo para a porta $porta:" 12 60 3 \
+            "tcp"   "Apenas TCP" \
+            "udp"   "Apenas UDP" \
+            "ambos" "TCP e UDP" \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && continue
+
+        local protos=()
+        case "$proto_sel" in
+            tcp)   protos=(tcp) ;;
+            udp)   protos=(udp) ;;
+            ambos) protos=(tcp udp) ;;
+            *)     continue ;;
+        esac
+
+        local origins=()
+        whiptail --title "iptables - Porta $porta" \
+            --yesno "Liberar porta $porta para qualquer origem?" 8 55
+        if [[ $? -eq 0 ]]; then
+            origins=("")
+        else
+            _coletar_origens origins "iptables - Porta $porta" \
+                "Origem para porta $porta (CIDR ou IP)\nDeixe vazio para finalizar:"
+        fi
+        [[ ${#origins[@]} -eq 0 ]] && continue
+
+        local src p
+        for src in "${origins[@]}"; do
+            for p in "${protos[@]}"; do
+                _ipt_add_port_rule rules_v4 rules_v6 "$p" "$porta" "$src"
+            done
+        done
+    done
+
+    if [[ ${#rules_v4[@]} -eq 0 && ${#rules_v6[@]} -eq 0 ]]; then
+        whiptail --title "iptables" --msgbox "Nenhuma regra adicionada." 8 50
+        return 0
+    fi
+
+    local aplicadas=0 ignoradas=0 falhas=0
+    local r
+    for r in "${rules_v4[@]}"; do
+        if iptables ${r/-A /-C } 2>/dev/null; then
+            ((ignoradas++)); continue
+        fi
+        if iptables $r 2>/dev/null; then
+            ((aplicadas++))
+        else
+            ((falhas++))
+        fi
+    done
+    for r in "${rules_v6[@]}"; do
+        if ip6tables ${r/-A /-C } 2>/dev/null; then
+            ((ignoradas++)); continue
+        fi
+        if ip6tables $r 2>/dev/null; then
+            ((aplicadas++))
+        else
+            ((falhas++))
+        fi
+    done
+
+    if (( aplicadas > 0 )); then
+        netfilter-persistent save
+    fi
+    _hub_log AUDIT "iptables: regras adicionadas (aplicadas=$aplicadas, ignoradas=$ignoradas, falhas=$falhas)"
+    whiptail --title "Concluido" \
+        --msgbox "Operacao finalizada.\n\nAplicadas: $aplicadas\nJa existentes (ignoradas): $ignoradas\nFalhas: $falhas\n\nO ruleset ativo foi preservado; apenas as novas regras foram anexadas e salvas." 14 65
+}
+
 preparar_zabbix() {
     if dpkg -l zabbix-agent 2>/dev/null | grep -q '^ii'; then
         whiptail --title "Zabbix" --msgbox "zabbix-agent (v1) detectado. Sera removido antes da instalacao do zabbix-agent2." 8 60
@@ -3294,16 +3393,18 @@ menu_monitoramento() {
 menu_firewall() {
     while true; do
         choice=$(whiptail --title "Firewall e Rede" --cancel-button "Voltar" \
-            --menu "Selecione uma opcao:" 16 70 4 \
-            "1" "Instalar e configurar iptables" \
-            "2" "Configurar Rota Default com Origem Publica" \
-            "3" "Configurar Loopback com IP Publico (/32)" \
+            --menu "Selecione uma opcao:" 17 70 5 \
+            "1" "Instalar e configurar iptables (recria do zero)" \
+            "2" "Adicionar regras ao iptables existente" \
+            "3" "Configurar Rota Default com Origem Publica" \
+            "4" "Configurar Loopback com IP Publico (/32)" \
             3>&1 1>&2 2>&3)
         [[ $? -ne 0 ]] && return 0
         case "$choice" in
-            1) _dispatch "iptables"           fn_iptables ;;
-            2) _dispatch "rota persistente"   fn_rota_persistente ;;
-            3) _dispatch "loopback ip publico" fn_configurar_loopbacks ;;
+            1) _dispatch "iptables"            fn_iptables ;;
+            2) _dispatch "iptables adicionar"  fn_iptables_adicionar ;;
+            3) _dispatch "rota persistente"    fn_rota_persistente ;;
+            4) _dispatch "loopback ip publico" fn_configurar_loopbacks ;;
         esac
     done
 }
