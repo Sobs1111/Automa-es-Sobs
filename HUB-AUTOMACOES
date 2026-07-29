@@ -142,6 +142,26 @@ Deixe vazio para finalizar." 10 65
     done
 }
 
+preparar_trust_anchor() {
+    mkdir -p /etc/unbound/unbound.conf.d /var/lib/unbound
+
+    # O pacote unbound do Debian/Ubuntu ja instala um snippet em conf.d
+    # (root-auto-trust-anchor-file.conf) declarando auto-trust-anchor-file para
+    # /var/lib/unbound/root.key. Como o server.conf gerado aqui declara a mesma
+    # diretiva, o arquivo seria carregado duas vezes e o unbound aborta com
+    # "trust anchor for '.' presented twice". Comenta a diretiva duplicada e
+    # mantem apenas a declaracao do server.conf.
+    for snippet in /etc/unbound/unbound.conf.d/*.conf; do
+        [[ -f "$snippet" ]] || continue
+        [[ "$snippet" == "/etc/unbound/unbound.conf.d/server.conf" ]] && continue
+        grep -qE '^[[:space:]]*auto-trust-anchor-file[[:space:]]*:' "$snippet" || continue
+        sed -i -E 's|^([[:space:]]*auto-trust-anchor-file[[:space:]]*:)|#\1|' "$snippet"
+    done
+
+    unbound-anchor -a /var/lib/unbound/root.key || true
+    chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
+}
+
 instalar_unbound_base() {
     apt install rsyslog ssh net-tools dnsutils unbound -y
 
@@ -187,6 +207,8 @@ remote-control:
 EOF
 
     unbound-control-setup >/dev/null 2>&1 || true
+
+    preparar_trust_anchor
 }
 
 gerar_config_unbound() {
@@ -318,6 +340,7 @@ gerar_config_unbound_reverso() {
         echo "    port: 53"
         echo "    log-replies: no"
         echo "    root-hints: /usr/share/dns/root.hints"
+        echo "    auto-trust-anchor-file: \"/var/lib/unbound/root.key\""
         echo "    harden-dnssec-stripped: yes"
         echo "    extended-statistics: yes"
         echo "    statistics-cumulative: no"
@@ -485,9 +508,6 @@ fn_instalar_recursivo() {
     fi
 
     instalar_unbound_base
-    mkdir -p /var/lib/unbound
-    unbound-anchor -a /var/lib/unbound/root.key || true
-    chown unbound:unbound /var/lib/unbound/root.key
     detectar_tier
     gerar_config_unbound "$outgoing_ip"
     aplicar_sysctl
@@ -2503,9 +2523,7 @@ fn_instalar_unbound_anycast() {
     touch /var/log/unbound/unbound.log
     chown -R unbound:unbound /var/log/unbound/
 
-    mkdir -p /var/lib/unbound
-    unbound-anchor -a /var/lib/unbound/root.key || true
-    chown unbound:unbound /var/lib/unbound/root.key
+    preparar_trust_anchor
 
     cat > /etc/unbound/unbound.conf <<EOF
 include: "/etc/unbound/unbound.conf.d/*.conf"
