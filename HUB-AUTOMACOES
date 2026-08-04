@@ -115,7 +115,7 @@ detectar_tier() {
             ;;
         alto)
             t_threads=16; t_slabs=8; t_rrset="4g"; t_msg="2g"
-            t_range=8192; t_qpt=8192; t_otcp=2048; t_itcp=4096
+            t_range=16384; t_qpt=8192; t_otcp=2048; t_itcp=4096
             ;;
     esac
 }
@@ -2548,7 +2548,7 @@ fn_configurar_unbound_anycast() {
         echo "    interface-automatic: no"
         [[ -n "$outgoing_ipv4" ]] && echo "    outgoing-interface: $outgoing_ipv4"
         [[ -n "$outgoing_ipv6" ]] && echo "    outgoing-interface: $outgoing_ipv6"
-        echo "    outgoing-range: 8192"
+        echo "    outgoing-range: 16384"
         echo "    outgoing-num-tcp: 1024"
         echo "    incoming-num-tcp: 2048"
         echo "    so-rcvbuf: 8m"
@@ -2557,7 +2557,7 @@ fn_configurar_unbound_anycast() {
         echo "    edns-buffer-size: 1232"
         echo "    msg-cache-size: 1g"
         echo "    msg-cache-slabs: $slabs"
-        echo "    num-queries-per-thread: 4096"
+        echo "    num-queries-per-thread: 8192"
         echo "    rrset-cache-size: 2g"
         echo "    rrset-cache-slabs: $slabs"
         echo "    infra-cache-slabs: $slabs"
