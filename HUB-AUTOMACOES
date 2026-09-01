@@ -162,8 +162,28 @@ preparar_trust_anchor() {
     chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
 }
 
+_unbound_limite_descritores() {
+    # outgoing-range e contado em descritor de arquivo, e a necessidade fica na
+    # ordem de num-threads x outgoing-range (16 threads x 16384 = ~262 mil).
+    # O limite soft padrao do systemd para um servico e 1024.
+    #
+    # O Unbound nao falha quando falta descritor: ele apenas registra
+    # "continuing with less udp ports" e reduz sozinho a quantidade de portas de
+    # saida. O resultado e um servidor rodando com uma fracao da capacidade que
+    # esta escrita na configuracao, sem nenhum erro visivel.
+    local dir="/etc/systemd/system/unbound.service.d"
+    mkdir -p "$dir"
+    cat > "$dir/limits.conf" <<'EOF'
+[Service]
+LimitNOFILE=524288
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 instalar_unbound_base() {
     apt install rsyslog ssh net-tools dnsutils unbound -y
+
+    _unbound_limite_descritores
 
     mkdir -p /etc/unbound/unbound.conf.d
 
@@ -2522,6 +2542,10 @@ fn_instalar_unbound_anycast() {
     mkdir -p /var/log/unbound
     touch /var/log/unbound/unbound.log
     chown -R unbound:unbound /var/log/unbound/
+
+    # O anycast nao passa por instalar_unbound_base, e e justamente o perfil com
+    # o outgoing-range mais alto - precisa do limite por conta propria.
+    _unbound_limite_descritores
 
     preparar_trust_anchor
 
