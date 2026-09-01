@@ -3496,19 +3496,43 @@ Responda Nao para instalar so o coletor e o CGNAT Hunter." 16 70; then
 }
 
 _syslog_instalar_pacotes() {
-    local -a pkgs=(rsyslog gawk gzip chrony)
-
     # O hunter usa match() com terceiro argumento, que so existe no gawk. O awk
     # padrao do Debian e o mawk, entao o gawk entra como dependencia explicita.
+    local -a pkgs=(rsyslog gawk gzip chrony apache2 apache2-utils php libapache2-mod-php)
+
+    apt update -qq
 
     if [[ "$syslog_usar_db" == "yes" ]]; then
-        pkgs+=(mariadb-server rsyslog-mysql apache2 apache2-utils php php-mysql php-gd libapache2-mod-php)
-    else
-        pkgs+=(apache2 apache2-utils php libapache2-mod-php)
+        # O mariadb-server precisa estar instalado E NO AR antes do
+        # rsyslog-mysql: numa instalacao unica o dpkg configura o rsyslog-mysql
+        # primeiro, o postinst dele nao acha o socket e o dbconfig-common falha.
+        echo "Instalando MariaDB..."
+        if ! apt install -y -o Dpkg::Options::="--force-confold" mariadb-server; then
+            whiptail --title "Erro" --msgbox "Falha ao instalar o MariaDB." 8 60
+            return 1
+        fi
+
+        systemctl enable --now mariadb
+        local i
+        for i in $(seq 1 30); do
+            mariadb -e "SELECT 1" >/dev/null 2>&1 && break
+            sleep 1
+        done
+        if ! mariadb -e "SELECT 1" >/dev/null 2>&1; then
+            whiptail --title "Erro - MariaDB" --msgbox "MariaDB nao subiu; abortando." 8 60
+            return 1
+        fi
+
+        # Impede o dbconfig-common de criar banco, usuario e o proprio
+        # /etc/rsyslog.d/mysql.conf: quem cuida disso e o kit, com a senha que
+        # ele gerou. Sem isso ficam duas configuracoes de ommysql concorrendo.
+        echo "rsyslog-mysql rsyslog-mysql/dbconfig-install boolean false" | debconf-set-selections
+        echo "rsyslog-mysql rsyslog-mysql/dbconfig-upgrade boolean false" | debconf-set-selections
+
+        pkgs+=(rsyslog-mysql php-mysql php-gd)
     fi
 
     echo "Instalando pacotes: ${pkgs[*]}"
-    apt update -qq
     if ! apt install -y -o Dpkg::Options::="--force-confold" "${pkgs[@]}"; then
         whiptail --title "Erro" --msgbox "Falha ao instalar os pacotes do kit syslog." 8 60
         return 1
@@ -3523,6 +3547,18 @@ _syslog_config_rsyslog() {
     chown root:adm "$syslog_log_dir"
     chmod 0750 "$syslog_log_dir"
 
+    # O pacote rsyslog-mysql instala um mysql.conf proprio que carrega o ommysql
+    # e manda *.* para o banco. Com o dbconfig desativado ele fica sem
+    # credencial valida, e de todo modo duplicaria o que este arquivo ja faz.
+    if [[ -f /etc/rsyslog.d/mysql.conf ]]; then
+        mv /etc/rsyslog.d/mysql.conf /etc/rsyslog.d/mysql.conf.disabled
+    fi
+
+    # O ommysql nao e carregado por padrao: sem este module() o rsyslog recusa a
+    # action com "module name 'ommysql' is unknown".
+    local mod_mysql=""
+    [[ "$syslog_usar_db" == "yes" ]] && mod_mysql='module(load="ommysql")'
+
     # A config do rsyslog nao tem nenhum "$", entao o heredoc pode ser expandido
     # com seguranca - o %HOSTNAME% dele nao e variavel de shell.
     cat > "$conf" <<EOF
@@ -3535,6 +3571,7 @@ _syslog_config_rsyslog() {
 # CGNATs nao entra no /var/log/syslog e nao depende de "stop" em outro arquivo.
 
 module(load="imudp" threads="2" timeRequery="8")
+${mod_mysql}
 
 template(name="CgnatFile" type="string"
          string="${syslog_log_dir}/%HOSTNAME:::secpath-replace%.log")
@@ -4349,10 +4386,12 @@ fn_syslog_cgnat() {
 
     _hub_log INFO "syslog: iniciando instalacao do kit (db=${syslog_usar_db})"
 
+    # O banco vem antes do rsyslog: a action ommysql da config aponta para o
+    # usuario 'rsyslog', que precisa existir antes do servico subir.
     _syslog_instalar_pacotes    || return 1
+    _syslog_config_mariadb      || return 1
     _syslog_config_rsyslog      || return 1
     _syslog_config_logrotate    || return 1
-    _syslog_config_mariadb      || return 1
     _syslog_instalar_hunter     || return 1
     _syslog_instalar_web_hunter || return 1
     _syslog_instalar_loganalyzer || true
