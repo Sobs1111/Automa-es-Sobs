@@ -3391,15 +3391,10 @@ PYEOF
 # padrao (e portanto no /var/log/syslog), sem depender da ordem de inclusao dos
 # arquivos em /etc/rsyslog.d.
 #
-# Consulta: dois caminhos complementares.
-#   - cgnat-hunter-daily: pericia sobre o arquivo (IP publico + porta -> IP
-#     privado). E a fonte de verdade, com a retencao legal completa.
-#   - LogAnalyzer sobre MariaDB: janela recente navegavel, com expurgo proprio
-#     para a tabela nao crescer sem limite.
+# Consulta: CGNAT Hunter, pericia sobre o arquivo (IP publico + porta -> IP
+# privado), por linha de comando e por interface web.
 # =============================================================================
 
-readonly SYSLOG_LA_VERSION="5.0.1"
-readonly SYSLOG_LA_URL="https://github.com/rsyslog/loganalyzer/releases/download/v5.0.1/loganalyzer-5.0.1.tar.gz"
 readonly SYSLOG_HUNTER_BIN="/usr/local/bin/cgnat-hunter-daily"
 readonly SYSLOG_WEB_DIR="/var/www/html/cgnat_hunter"
 readonly SYSLOG_HTPASSWD="/etc/apache2/cgnat_hunter.htpasswd"
@@ -3409,12 +3404,10 @@ _syslog_coletar_dados() {
     declare -g syslog_log_dir="/var/log/cgnat"
     declare -g syslog_retencao="1830"
     declare -g syslog_porta="514"
-    declare -g syslog_usar_db="no"
-    declare -g syslog_db_retencao="90"
-    declare -g syslog_db_pwd=""
     declare -g syslog_web_user="cgnat"
     declare -g syslog_web_pwd=""
     declare -g -a syslog_origens=()
+    declare -g -a syslog_web_origens=()
 
     syslog_log_dir=$(whiptail --title "Syslog CGNAT - Armazenamento" \
         --inputbox "Diretorio base dos logs:" 10 60 "/var/log/cgnat" \
@@ -3451,26 +3444,16 @@ Deixe vazio para finalizar." 12 65
 "Nenhuma origem informada.\n\nA porta ${syslog_porta}/udp ficaria aberta para qualquer host, o que permite injecao de log forjado.\n\nProsseguir mesmo assim?" 13 68 || return 1
     fi
 
-    if whiptail --title "Syslog CGNAT - Banco" --yesno \
-"Instalar tambem MariaDB + LogAnalyzer ${SYSLOG_LA_VERSION}?
+    whiptail --title "Syslog CGNAT - Acesso web" --msgbox \
+"Informe agora de onde a interface web pode ser acessada (rede da
+operacao, VPN, estacao do NOC).
 
-Da uma interface web para navegar o log recente. O arquivo continua
-sendo a fonte de verdade com a retencao completa; o banco guarda
-apenas uma janela curta, com expurgo automatico.
+A consulta devolve qual assinante estava atras de um IP publico, que
+e dado pessoal - nao convem deixar a porta 80 aberta para qualquer um.
+Deixe vazio para finalizar." 14 68
 
-Responda Nao para instalar so o coletor e o CGNAT Hunter." 16 70; then
-        syslog_usar_db="yes"
-
-        syslog_db_retencao=$(whiptail --title "Syslog CGNAT - Retencao do banco" \
-            --inputbox "Retencao na tabela SystemEvents, em dias:\n(janela de navegacao do LogAnalyzer)" 11 60 "90" \
-            3>&1 1>&2 2>&3) || return 1
-        if ! [[ "$syslog_db_retencao" =~ ^[0-9]+$ ]] || (( syslog_db_retencao < 1 )); then
-            whiptail --title "Erro" --msgbox "Retencao invalida: $syslog_db_retencao" 8 60
-            return 1
-        fi
-    else
-        syslog_usar_db="no"
-    fi
+    _coletar_origens syslog_web_origens "Syslog CGNAT - Acesso web" \
+        "IP ou CIDR autorizado na interface web\n(deixe vazio para finalizar):"
 
     syslog_web_user=$(whiptail --title "Syslog CGNAT - Acesso web" \
         --inputbox "Usuario para acessar o CGNAT Hunter:" 10 60 "cgnat" \
@@ -3488,10 +3471,6 @@ Responda Nao para instalar so o coletor e o CGNAT Hunter." 16 70; then
         return 1
     fi
 
-    # A senha do banco nao e digitada: e gerada e guardada em HUB_CRED_DIR, para
-    # nao repetir a senha do root do MariaDB no arquivo de configuracao do rsyslog.
-    syslog_db_pwd=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
-
     return 0
 }
 
@@ -3500,39 +3479,8 @@ _syslog_instalar_pacotes() {
     # padrao do Debian e o mawk, entao o gawk entra como dependencia explicita.
     local -a pkgs=(rsyslog gawk gzip chrony apache2 apache2-utils php libapache2-mod-php)
 
-    apt update -qq
-
-    if [[ "$syslog_usar_db" == "yes" ]]; then
-        # O mariadb-server precisa estar instalado E NO AR antes do
-        # rsyslog-mysql: numa instalacao unica o dpkg configura o rsyslog-mysql
-        # primeiro, o postinst dele nao acha o socket e o dbconfig-common falha.
-        echo "Instalando MariaDB..."
-        if ! apt install -y -o Dpkg::Options::="--force-confold" mariadb-server; then
-            whiptail --title "Erro" --msgbox "Falha ao instalar o MariaDB." 8 60
-            return 1
-        fi
-
-        systemctl enable --now mariadb
-        local i
-        for i in $(seq 1 30); do
-            mariadb -e "SELECT 1" >/dev/null 2>&1 && break
-            sleep 1
-        done
-        if ! mariadb -e "SELECT 1" >/dev/null 2>&1; then
-            whiptail --title "Erro - MariaDB" --msgbox "MariaDB nao subiu; abortando." 8 60
-            return 1
-        fi
-
-        # Impede o dbconfig-common de criar banco, usuario e o proprio
-        # /etc/rsyslog.d/mysql.conf: quem cuida disso e o kit, com a senha que
-        # ele gerou. Sem isso ficam duas configuracoes de ommysql concorrendo.
-        echo "rsyslog-mysql rsyslog-mysql/dbconfig-install boolean false" | debconf-set-selections
-        echo "rsyslog-mysql rsyslog-mysql/dbconfig-upgrade boolean false" | debconf-set-selections
-
-        pkgs+=(rsyslog-mysql php-mysql php-gd)
-    fi
-
     echo "Instalando pacotes: ${pkgs[*]}"
+    apt update -qq
     if ! apt install -y -o Dpkg::Options::="--force-confold" "${pkgs[@]}"; then
         whiptail --title "Erro" --msgbox "Falha ao instalar os pacotes do kit syslog." 8 60
         return 1
@@ -3547,18 +3495,6 @@ _syslog_config_rsyslog() {
     chown root:adm "$syslog_log_dir"
     chmod 0750 "$syslog_log_dir"
 
-    # O pacote rsyslog-mysql instala um mysql.conf proprio que carrega o ommysql
-    # e manda *.* para o banco. Com o dbconfig desativado ele fica sem
-    # credencial valida, e de todo modo duplicaria o que este arquivo ja faz.
-    if [[ -f /etc/rsyslog.d/mysql.conf ]]; then
-        mv /etc/rsyslog.d/mysql.conf /etc/rsyslog.d/mysql.conf.disabled
-    fi
-
-    # O ommysql nao e carregado por padrao: sem este module() o rsyslog recusa a
-    # action com "module name 'ommysql' is unknown".
-    local mod_mysql=""
-    [[ "$syslog_usar_db" == "yes" ]] && mod_mysql='module(load="ommysql")'
-
     # A config do rsyslog nao tem nenhum "$", entao o heredoc pode ser expandido
     # com seguranca - o %HOSTNAME% dele nao e variavel de shell.
     cat > "$conf" <<EOF
@@ -3571,7 +3507,6 @@ _syslog_config_rsyslog() {
 # CGNATs nao entra no /var/log/syslog e nao depende de "stop" em outro arquivo.
 
 module(load="imudp" threads="2" timeRequery="8")
-${mod_mysql}
 
 template(name="CgnatFile" type="string"
          string="${syslog_log_dir}/%HOSTNAME:::secpath-replace%.log")
@@ -3592,26 +3527,6 @@ ruleset(name="cgnat"
            ioBufferSize="64k"
            flushOnTXEnd="off"
            asyncWriting="on")
-EOF
-
-    if [[ "$syslog_usar_db" == "yes" ]]; then
-        cat >> "$conf" <<EOF
-
-    # Fila em disco: se o MariaDB cair, a mensagem espera em vez de se perder.
-    action(type="ommysql"
-           server="localhost"
-           db="Syslog"
-           uid="rsyslog"
-           pwd="${syslog_db_pwd}"
-           queue.type="LinkedList"
-           queue.filename="q_cgnat_mysql"
-           queue.maxDiskSpace="2g"
-           queue.saveOnShutdown="on"
-           action.resumeRetryCount="-1")
-EOF
-    fi
-
-    cat >> "$conf" <<EOF
 }
 
 # rcvbufSize maior e rate limit desligado: no volume de CGNAT o padrao descarta
@@ -3674,114 +3589,6 @@ Rode 'logrotate -d $conf' para ver o detalhe." 10 65
     fi
 
     systemctl enable --now logrotate.timer 2>/dev/null || true
-    return 0
-}
-
-_syslog_config_mariadb() {
-    [[ "$syslog_usar_db" != "yes" ]] && return 0
-
-    systemctl enable --now mariadb
-    systemctl restart mariadb
-
-    # Aguarda o socket subir antes de mandar SQL.
-    local i
-    for i in $(seq 1 30); do
-        mariadb -e "SELECT 1" >/dev/null 2>&1 && break
-        sleep 1
-    done
-
-    if ! mariadb -e "SELECT 1" >/dev/null 2>&1; then
-        whiptail --title "Erro - MariaDB" --msgbox "Nao foi possivel conectar ao MariaDB local." 8 60
-        return 1
-    fi
-
-    # O schema do pacote rsyslog-mysql nao traz processid nem checksum, que o
-    # LogAnalyzer espera; sem elas a home dele quebra com "Unknown column".
-    # E a SystemEvents nasce so com PRIMARY KEY(ID), o que faz cada consulta do
-    # LogAnalyzer varrer a tabela inteira.
-    mariadb <<SQLEOF
-CREATE DATABASE IF NOT EXISTS Syslog CHARACTER SET utf8mb4;
-CREATE USER IF NOT EXISTS 'rsyslog'@'localhost' IDENTIFIED BY '${syslog_db_pwd}';
-ALTER USER 'rsyslog'@'localhost' IDENTIFIED BY '${syslog_db_pwd}';
-GRANT ALL PRIVILEGES ON Syslog.* TO 'rsyslog'@'localhost';
-FLUSH PRIVILEGES;
-SQLEOF
-
-    if [[ -f /usr/share/dbconfig-common/data/rsyslog-mysql/install/mysql ]]; then
-        mariadb Syslog < /usr/share/dbconfig-common/data/rsyslog-mysql/install/mysql 2>/dev/null || true
-    fi
-
-    mariadb Syslog <<SQLEOF
-ALTER TABLE SystemEvents ADD COLUMN IF NOT EXISTS checksum INT NOT NULL DEFAULT 0;
-ALTER TABLE SystemEvents ADD COLUMN IF NOT EXISTS processid VARCHAR(60) NOT NULL DEFAULT '';
-CREATE INDEX IF NOT EXISTS idx_devicereportedtime ON SystemEvents (DeviceReportedTime);
-CREATE INDEX IF NOT EXISTS idx_receivedat ON SystemEvents (ReceivedAt);
-CREATE INDEX IF NOT EXISTS idx_fromhost ON SystemEvents (FromHost);
-SQLEOF
-
-    # Expurgo em lotes pequenos, de hora em hora: um DELETE unico sobre milhoes
-    # de linhas travaria a tabela e a ingestao junto.
-    mariadb <<SQLEOF
-SET GLOBAL event_scheduler = ON;
-DROP EVENT IF EXISTS Syslog.purge_systemevents;
-CREATE EVENT Syslog.purge_systemevents
-ON SCHEDULE EVERY 1 HOUR
-DO DELETE FROM Syslog.SystemEvents
-   WHERE ReceivedAt < NOW() - INTERVAL ${syslog_db_retencao} DAY
-   LIMIT 50000;
-SQLEOF
-
-    mkdir -p /etc/mysql/mariadb.conf.d
-    cat > /etc/mysql/mariadb.conf.d/99-cgnat.cnf <<'EOF'
-[mysqld]
-event_scheduler = ON
-EOF
-
-    systemctl restart mariadb
-
-    local cred_dir="$HUB_CRED_DIR/syslog"
-    mkdir -p "$cred_dir"
-    chmod 700 "$HUB_CRED_DIR" 2>/dev/null
-    chmod 700 "$cred_dir" 2>/dev/null
-    {
-        printf 'DB=Syslog\n'
-        printf 'USER=rsyslog\n'
-        printf 'SENHA=%s\n' "$syslog_db_pwd"
-    } > "$cred_dir/mariadb.cred"
-    chmod 600 "$cred_dir/mariadb.cred"
-
-    return 0
-}
-
-_syslog_instalar_loganalyzer() {
-    [[ "$syslog_usar_db" != "yes" ]] && return 0
-
-    local tmp="/tmp/loganalyzer-${SYSLOG_LA_VERSION}.tar.gz"
-    local dest="/var/www/html/logs"
-
-    echo "Baixando LogAnalyzer ${SYSLOG_LA_VERSION}..."
-    if ! wget -q "$SYSLOG_LA_URL" -O "$tmp" || [[ ! -s "$tmp" ]]; then
-        whiptail --title "Erro" --msgbox \
-"Falha ao baixar o LogAnalyzer ${SYSLOG_LA_VERSION}.
-Verifique a conectividade. O restante do kit segue instalado." 10 65
-        return 1
-    fi
-
-    rm -rf "/tmp/loganalyzer-${SYSLOG_LA_VERSION}"
-    tar -xzf "$tmp" -C /tmp || return 1
-
-    rm -rf "$dest"
-    mv "/tmp/loganalyzer-${SYSLOG_LA_VERSION}/src" "$dest" || return 1
-
-    # O configure.sh do projeto so cria um config.php gravavel no diretorio
-    # corrente; roda-lo de outro lugar deixa o instalador sem onde escrever.
-    touch "$dest/config.php"
-    chown -R www-data:www-data "$dest"
-    chmod 0660 "$dest/config.php"
-
-    rm -rf "/tmp/loganalyzer-${SYSLOG_LA_VERSION}" "$tmp"
-
-    systemctl restart apache2
     return 0
 }
 
@@ -4308,20 +4115,12 @@ PHPEOF
     chown root:www-data "$SYSLOG_HTPASSWD"
     chmod 0640 "$SYSLOG_HTPASSWD"
 
-    # O LogAnalyzer entra atras da mesma autenticacao: ate alguem concluir o
-    # assistente, o install.php dele fica aberto para qualquer um apontar o
-    # banco. O login proprio do LogAnalyzer so passa a valer depois disso.
+    # A consulta devolve qual assinante estava atras de um IP publico, que e
+    # dado pessoal; a pagina nao pode ficar aberta a quem alcancar o servidor.
     cat > /etc/apache2/conf-available/cgnat-hunter.conf <<EOF
 <Directory ${SYSLOG_WEB_DIR}>
     AuthType Basic
     AuthName "CGNAT Hunter - acesso restrito"
-    AuthUserFile ${SYSLOG_HTPASSWD}
-    Require valid-user
-</Directory>
-
-<Directory /var/www/html/logs>
-    AuthType Basic
-    AuthName "LogAnalyzer - acesso restrito"
     AuthUserFile ${SYSLOG_HTPASSWD}
     Require valid-user
 </Directory>
@@ -4342,17 +4141,29 @@ Rode 'apache2ctl configtest' para ver o detalhe." 10 65
     return 0
 }
 
+# O endereco mostrado no resumo precisa ser alcancavel de fora. O detectar_ips
+# devolve o loopback primeiro, porque "ip -4 addr show" comeca pela interface lo.
+_syslog_ip_acesso() {
+    local ip
+    for ip in "${ipv4_list[@]}"; do
+        [[ "$ip" == 127.* ]] && continue
+        printf '%s\n' "$ip"
+        return 0
+    done
+    printf '%s\n' "<ip-do-servidor>"
+}
+
 _syslog_firewall() {
-    if [[ ${#syslog_origens[@]} -eq 0 ]]; then
+    if [[ ${#syslog_origens[@]} -eq 0 && ${#syslog_web_origens[@]} -eq 0 ]]; then
         return 0
     fi
 
     if ! systemctl is-active --quiet netfilter-persistent 2>/dev/null &&
        ! iptables -L INPUT -n 2>/dev/null | grep -q "DROP\|REJECT"; then
         whiptail --title "Syslog CGNAT - Firewall" --msgbox \
-"Nenhum firewall ativo detectado. As regras de liberacao da porta ${syslog_porta}/udp nao foram aplicadas.
+"Nenhum firewall ativo detectado. Nenhuma regra foi aplicada - a porta ${syslog_porta}/udp e a interface web ficam acessiveis conforme a rede permitir.
 
-Use 'Firewall e Rede' no menu principal para montar o ruleset e depois reaplique." 12 68
+Use 'Firewall e Rede' no menu principal para montar o ruleset e depois reaplique." 13 68
         return 0
     fi
 
@@ -4365,8 +4176,18 @@ Use 'Firewall e Rede' no menu principal para montar o ruleset e depois reaplique
         fi
     done
 
+    # Sem isso a interface fica instalada e inalcancavel num servidor com
+    # INPUT DROP - a consulta e feita por navegador, nao pela porta de syslog.
+    for src in "${syslog_web_origens[@]}"; do
+        if [[ "$src" == *:* ]]; then
+            ip6tables -A INPUT -p tcp -s "$src" --dport 80 -j ACCEPT
+        else
+            iptables  -A INPUT -p tcp -s "$src" --dport 80 -j ACCEPT
+        fi
+    done
+
     netfilter-persistent save >/dev/null 2>&1
-    _hub_log INFO "syslog: liberadas ${#syslog_origens[@]} origem(ns) na porta ${syslog_porta}/udp"
+    _hub_log INFO "syslog: liberadas ${#syslog_origens[@]} origem(ns) em ${syslog_porta}/udp e ${#syslog_web_origens[@]} em 80/tcp"
     return 0
 }
 
@@ -4374,42 +4195,37 @@ fn_syslog_cgnat() {
     _syslog_coletar_dados || return 1
 
     local resumo="Confirma a instalacao do kit?\n\n"
-    resumo+="  Diretorio:      ${syslog_log_dir}\n"
-    resumo+="  Retencao:       ${syslog_retencao} dias\n"
-    resumo+="  Porta:          ${syslog_porta}/udp\n"
-    resumo+="  Origens:        ${#syslog_origens[@]}\n"
-    resumo+="  Banco + web:    ${syslog_usar_db}\n"
-    [[ "$syslog_usar_db" == "yes" ]] && resumo+="  Retencao banco: ${syslog_db_retencao} dias\n"
-    resumo+="  Usuario web:    ${syslog_web_user}\n"
+    resumo+="  Diretorio:    ${syslog_log_dir}\n"
+    resumo+="  Retencao:     ${syslog_retencao} dias\n"
+    resumo+="  Porta:        ${syslog_porta}/udp\n"
+    resumo+="  Origens log:  ${#syslog_origens[@]}\n"
+    resumo+="  Origens web:  ${#syslog_web_origens[@]}\n"
+    resumo+="  Usuario web:  ${syslog_web_user}\n"
 
-    whiptail --title "Syslog CGNAT - Confirmacao" --yesno "$resumo" 18 66 || return 1
+    whiptail --title "Syslog CGNAT - Confirmacao" --yesno "$resumo" 17 66 || return 1
 
-    _hub_log INFO "syslog: iniciando instalacao do kit (db=${syslog_usar_db})"
+    _hub_log INFO "syslog: iniciando instalacao do kit"
 
-    # O banco vem antes do rsyslog: a action ommysql da config aponta para o
-    # usuario 'rsyslog', que precisa existir antes do servico subir.
     _syslog_instalar_pacotes    || return 1
-    _syslog_config_mariadb      || return 1
     _syslog_config_rsyslog      || return 1
     _syslog_config_logrotate    || return 1
     _syslog_instalar_hunter     || return 1
     _syslog_instalar_web_hunter || return 1
-    _syslog_instalar_loganalyzer || true
     _syslog_firewall
 
     detectar_ips
-    local ip_acesso="${ipv4_list[0]:-<ip-do-servidor>}"
+    local ip_acesso
+    ip_acesso=$(_syslog_ip_acesso)
 
     local final="Kit syslog CGNAT instalado.\n\n"
-    final+="Coleta:    ${syslog_porta}/udp -> ${syslog_log_dir}/<host>.log\n"
-    final+="Rotacao:   diaria, ${syslog_retencao} dias, comprimida\n"
-    final+="Hunter:    http://${ip_acesso}/cgnat_hunter/\n"
-    final+="CLI:       ${SYSLOG_HUNTER_BIN}\n"
-    [[ "$syslog_usar_db" == "yes" ]] && final+="LogAnalyzer: http://${ip_acesso}/logs/\n"
-    final+="\nAuditoria de consultas: ${SYSLOG_AUDIT_LOG}\n"
-    [[ "$syslog_usar_db" == "yes" ]] && final+="Senha do banco: ${HUB_CRED_DIR}/syslog/mariadb.cred\n"
+    final+="Coleta:   ${syslog_porta}/udp -> ${syslog_log_dir}/<host>.log\n"
+    final+="Rotacao:  diaria, ${syslog_retencao} dias, comprimida\n"
+    final+="Hunter:   http://${ip_acesso}/cgnat_hunter/\n"
+    final+="CLI:      ${SYSLOG_HUNTER_BIN}\n"
+    final+="\nUsuario web: ${syslog_web_user}\n"
+    final+="Auditoria de consultas: ${SYSLOG_AUDIT_LOG}\n"
 
-    whiptail --title "Concluido" --msgbox "$final" 20 72
+    whiptail --title "Concluido" --msgbox "$final" 18 72
     _hub_log INFO "syslog: kit instalado com sucesso"
     return 0
 }
