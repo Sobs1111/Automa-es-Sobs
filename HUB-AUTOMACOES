@@ -65,8 +65,12 @@ is_private_ip() {
 }
 
 detectar_ips() {
-    mapfile -t ipv4_list < <(ip -4 addr show | awk '/inet / {print $2}' | cut -d/ -f1)
-    mapfile -t ipv6_list < <(ip -6 addr show | awk '/inet6 / {print $2}' | cut -d/ -f1 | grep -v '^fe80')
+    # Endereco em estado tentative (DAD ainda em curso), dadfailed (IP duplicado
+    # na rede) ou deprecated nao aceita bind. O unbound nao pula a interface
+    # problematica: ele aborta o start inteiro com "can't bind socket: Cannot
+    # assign requested address" e o servico fica fora do ar por completo.
+    mapfile -t ipv4_list < <(ip -4 addr show | awk '/inet / && !/tentative|dadfailed|deprecated/ {print $2}' | cut -d/ -f1)
+    mapfile -t ipv6_list < <(ip -6 addr show | awk '/inet6 / && !/tentative|dadfailed|deprecated/ {print $2}' | cut -d/ -f1 | grep -v '^fe80')
 }
 
 confirmar_ips() {
@@ -180,6 +184,16 @@ EOF
     systemctl daemon-reload 2>/dev/null || true
 }
 
+_unbound_restart() {
+    # O watchdog monitor-unbound e o Restart= do proprio unit competem pelo
+    # mesmo servico. Quando os dois disparam juntos o systemd estoura o
+    # StartLimitBurst e passa a recusar o start ("Start request repeated too
+    # quickly") sem nem tentar subir o processo - inclusive depois que a causa
+    # original ja foi corrigida. Limpa o estado failed antes de subir.
+    systemctl reset-failed unbound 2>/dev/null || true
+    systemctl restart unbound
+}
+
 instalar_unbound_base() {
     apt install rsyslog ssh net-tools dnsutils unbound -y
 
@@ -258,6 +272,7 @@ gerar_config_unbound() {
             echo "    so-rcvbuf: 8m"
             echo "    so-sndbuf: 8m"
             echo "    so-reuseport: yes"
+            echo "    ip-freebind: yes"
             echo "    edns-buffer-size: 1232"
             echo "    msg-cache-size: $t_msg"
             echo "    msg-cache-slabs: $t_slabs"
@@ -329,6 +344,7 @@ gerar_config_unbound() {
         echo "    so-rcvbuf: 4m"
         echo "    so-sndbuf: 4m"
         echo "    so-reuseport: yes"
+        echo "    ip-freebind: yes"
         echo "    prefetch: yes"
         echo "    prefetch-key: yes"
         echo "    hide-identity: yes"
@@ -378,6 +394,7 @@ gerar_config_unbound_reverso() {
         echo "    so-rcvbuf: 1m"
         echo "    so-sndbuf: 1m"
         echo "    so-reuseport: yes"
+        echo "    ip-freebind: yes"
         echo "    prefetch: yes"
         echo "    prefetch-key: yes"
         echo "    hide-identity: yes"
@@ -532,7 +549,7 @@ fn_instalar_recursivo() {
     gerar_config_unbound "$outgoing_ip"
     aplicar_sysctl
     fn_monitor_unbound_silencioso
-    systemctl restart unbound
+    _unbound_restart
     whiptail --title "Concluido" --msgbox "Unbound recursivo instalado e configurado.\nServico de monitoramento instalado automaticamente." 10 60
     pos_dns
 }
@@ -568,9 +585,6 @@ fn_reverso() {
         echo "access-control: ::/0 refuse_non_local"
         echo "access-control: 0.0.0.0/0 refuse_non_local"
     } > /etc/unbound/acl.conf
-
-    fn_monitor_unbound_silencioso
-    whiptail --title "Aviso" --msgbox "Servico de monitoramento do Unbound instalado automaticamente." 8 60
 
     OUTPUT="/etc/unbound/local_zone.conf"
 
@@ -778,9 +792,14 @@ fn_reverso() {
     install -m 0644 -o root -g root "$_buf" "$OUTPUT"
     rm -f "$_buf"
 
+    # O watchdog so entra depois que a zona esta escrita e a config validada.
+    # Instalado antes, ele ficaria reiniciando o unbound durante os minutos de
+    # preenchimento dos prompts e estouraria o StartLimitBurst do systemd.
+    fn_monitor_unbound_silencioso
+
     if unbound-checkconf > /dev/null 2>&1; then
-        systemctl restart unbound
-        whiptail --title "Concluido" --msgbox "Arquivo gerado: $OUTPUT\nUnbound reiniciado com sucesso." 10 60
+        _unbound_restart
+        whiptail --title "Concluido" --msgbox "Arquivo gerado: $OUTPUT\nUnbound reiniciado com sucesso.\nServico de monitoramento instalado." 10 60
     else
         local erros
         erros=$(unbound-checkconf 2>&1)
@@ -1332,7 +1351,7 @@ EOF
     usermod -a -G unbound zabbix
 
     _escrever_userparameter_unbound
-    systemctl restart unbound
+    _unbound_restart
     systemctl restart zabbix-agent2
     sys_hostname=$(hostname)
     whiptail --title "Concluido" --msgbox "Zabbix Agent2 com monitoramento do Unbound configurado.\nHostname: ${sys_hostname}" 8 60
@@ -1525,29 +1544,113 @@ EOF
     fi
 }
 
-fn_ookla() {
-    cd /tmp || return 1
+_ookla_matar_residuos() {
+    # O ooklaserver.sh do fornecedor monta a lista de PIDs remanescentes
+    # separada por quebras de linha e passa tudo como argumento unico para o
+    # kill, que rejeita ("argumentos devem ser IDs de trabalhos ou processo").
+    # Os daemons sobrevivem rodando como root: seguram as portas e reescrevem o
+    # OoklaServer.pid com dono root, o que faz o servico do systemd (como
+    # ookla_user) nao conseguir ler o proprio pidfile.
+    pkill -x OoklaServer 2>/dev/null || true
+    local _i
+    for _i in 1 2 3 4 5; do
+        pgrep -x OoklaServer >/dev/null 2>&1 || break
+        sleep 1
+    done
+    if pgrep -x OoklaServer >/dev/null 2>&1; then
+        pkill -9 -x OoklaServer 2>/dev/null || true
+        sleep 1
+    fi
 
-    wget -q https://install.speedtest.net/ooklaserver/ooklaserver.sh -O ooklaserver.sh
-    if [[ $? -ne 0 ]]; then
+    # O OoklaServer coordena suas instancias por mutexes nomeados em /tmp
+    # (OoklaManMu_, OoklaSerMu_, OoklaShMemManMu_, OoklaShMemSerMu_, cada um com
+    # um hash do caminho de instalacao) e por objetos de memoria compartilhada
+    # POSIX em /dev/shm. O instalador roda como root e sobe o daemon, entao tudo
+    # nasce root:root 0640. Na subida seguinte, ja como ookla_user, o open()
+    # devolve EACCES: os mutexes viram um "std::exception" sem texto logo apos o
+    # instance ID, e o /dev/shm vira "Cannot create shared memory object". Em
+    # ambos os casos o servidor morre sem abrir porta nenhuma.
+    rm -f /tmp/Ookla*.mutex /dev/shm/Ookla*
+}
+
+fn_ookla() {
+    local _home="/home/ookla_user"
+
+    # O unit declara User=ookla_user. Sem a conta o systemd nem chega a executar
+    # o ExecStart: aborta antes com 217/USER ("Failed to determine user
+    # credentials") e o Restart=always transforma isso em loop de reinicio.
+    if ! id -u ookla_user >/dev/null 2>&1; then
+        if ! useradd --system --user-group --create-home --home-dir "$_home" \
+                     --shell /usr/sbin/nologin ookla_user; then
+            whiptail --title "Erro" --msgbox "Falha ao criar o usuario ookla_user." 8 60
+            return 1
+        fi
+    fi
+    mkdir -p "$_home"
+
+    # O instalador da Ookla extrai o servidor no diretorio corrente. Rodando a
+    # partir de /tmp, os binarios ficavam la (sujeitos a limpeza no boot) e o
+    # ExecStart apontava para um /home/ookla_user/ooklaserver.sh inexistente.
+    cd "$_home" || return 1
+
+    if ! wget -q https://install.speedtest.net/ooklaserver/ooklaserver.sh -O ooklaserver.sh; then
         whiptail --title "Erro" --msgbox "Falha ao baixar o instalador do Ookla. Verifique a conectividade." 8 60
         return 1
     fi
 
     chmod +x ooklaserver.sh
-    bash ooklaserver.sh install
+
+    # Instalacao anterior (inclusive a que rodou de /tmp) pode ter deixado
+    # daemons ativos; eles disputariam as portas com a nova instancia.
+    systemctl stop ookla.service 2>/dev/null || true
+    _ookla_matar_residuos
+
+    yes | bash ooklaserver.sh install
+
+    # O instalador sobe o daemon como root assim que termina. Sem derrubar esse
+    # processo, ele fica com as portas do OoklaServer e o start pelo systemd
+    # (como ookla_user) falha.
+    bash ooklaserver.sh stop >/dev/null 2>&1 || true
+    _ookla_matar_residuos
+
+    # O pidfile herda o dono root do daemon que o instalador subiu. O chown
+    # abaixo corrige, mas so vale se nenhum processo root sobreviver para
+    # reescreve-lo - por isso o _ookla_matar_residuos vem antes.
+    rm -f "$_home/OoklaServer.pid"
+
+    # O properties instalado pela Ookla manda o log para ConsoleChannel. Sob
+    # --daemon essa saida e descartada e, com Type=forking, o journalctl tambem
+    # nao captura nada: qualquer falha do servidor fica completamente invisivel.
+    if [[ -f "$_home/OoklaServer.properties" ]]; then
+        mkdir -p /var/log/ookla
+        chown ookla_user:ookla_user /var/log/ookla
+        sed -i 's|^logging.loggers.app.channel.class *=.*|logging.loggers.app.channel.class = FileChannel|' \
+            "$_home/OoklaServer.properties"
+        if ! grep -q '^logging.loggers.app.channel.path' "$_home/OoklaServer.properties"; then
+            {
+                echo "logging.loggers.app.channel.path = /var/log/ookla/OoklaServer.log"
+                echo "logging.loggers.app.channel.rotation = 10 M"
+                echo "logging.loggers.app.channel.archive = timestamp"
+                echo "logging.loggers.app.channel.purgeCount = 5"
+            } >> "$_home/OoklaServer.properties"
+        fi
+    fi
+
+    chown -R ookla_user:ookla_user "$_home"
 
     cat > /etc/systemd/system/ookla.service <<EOF
 [Unit]
 Description=OoklaServer start after reboot
 After=network.target
-StartLimitIntervalSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 User=ookla_user
 Group=ookla_user
 WorkingDirectory=/home/ookla_user/
 Type=forking
+PIDFile=/home/ookla_user/OoklaServer.pid
 KillMode=process
 ExecStart=/bin/bash /home/ookla_user/ooklaserver.sh start
 TimeoutStartSec=30
@@ -2578,6 +2681,7 @@ fn_configurar_unbound_anycast() {
         echo "    so-rcvbuf: 8m"
         echo "    so-sndbuf: 8m"
         echo "    so-reuseport: yes"
+        echo "    ip-freebind: yes"
         echo "    edns-buffer-size: 1232"
         echo "    msg-cache-size: 1g"
         echo "    msg-cache-slabs: $slabs"
@@ -2648,7 +2752,7 @@ EOF
 
     unbound-control-setup
     systemctl enable unbound
-    systemctl restart unbound
+    _unbound_restart
 }
 
 fn_configurar_irqbalance_anycast() {
