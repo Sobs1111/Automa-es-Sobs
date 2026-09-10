@@ -4334,6 +4334,1316 @@ fn_syslog_cgnat() {
     return 0
 }
 
+# =============================================================================
+# NetFlow CGNAT Cisco (ASR)
+#
+# Coleta: nfcapd, um servico systemd por equipamento. Cada caixa tem ident,
+# porta UDP e diretorio proprios, entao adicionar um ASR novo nao encosta na
+# coleta das outras. O arquivo vira a cada 5 min em subpasta YYYY/MM/DD.
+#
+# O nfcapd roda como usuario de sistema sem shell. O diretorio de cada caixa e
+# setgid adm: as subpastas de data que o nfcapd cria herdam o grupo, senao a
+# leitura pelo Apache quebraria na primeira virada de dia.
+#
+# Consulta: CGNAT Hunter Cisco, pericia sobre o binario do nfdump (IP publico +
+# porta -> IP privado), por linha de comando e por interface web. A reconstrucao
+# do bloco de portas usa fim = inicio + (size * step) - 1, e a porta so casa se
+# tambem estiver no salto: (porta - inicio) % step == 0.
+# =============================================================================
+
+readonly CISCO_REG_DIR="/etc/hub-automacoes/cgnat-cisco"
+readonly CISCO_KIT_CONF="/etc/hub-automacoes/cgnat-cisco.conf"
+readonly CISCO_HUNTER_BIN="/usr/local/bin/cgnat-hunter-cisco"
+readonly CISCO_WEB_DIR="/var/www/html/cgnat_hunter_cisco"
+readonly CISCO_HTPASSWD="/etc/apache2/cgnat_hunter_cisco.htpasswd"
+readonly CISCO_AUDIT_LOG="/var/log/cgnat-hunter-cisco-audit.log"
+readonly CISCO_EXPIRE_BIN="/usr/local/sbin/cgnat-cisco-expire"
+readonly CISCO_SVC_USER="nfcapd"
+
+# -----------------------------------------------------------------------------
+# Registro de equipamentos: um arquivo CHAVE=valor por caixa, como o kit Huawei.
+# Fica legivel pelo grupo adm porque o hunter web (www-data) le a lista.
+# -----------------------------------------------------------------------------
+_cisco_reg_init() {
+    mkdir -p "$CISCO_REG_DIR" 2>/dev/null
+    chown root:adm "$CISCO_REG_DIR" 2>/dev/null
+    chmod 0750 "$CISCO_REG_DIR" 2>/dev/null
+}
+
+_cisco_reg_slugs() {
+    local f
+    for f in "$CISCO_REG_DIR"/*.conf; do
+        [[ -f "$f" ]] || continue
+        basename "$f" .conf
+    done
+}
+
+_cisco_reg_load() {
+    local slug="$1" key val
+    declare -g cisco_nome="" cisco_porta="" cisco_dir="" cisco_step="" cisco_origens=""
+    [[ -r "$CISCO_REG_DIR/$slug.conf" ]] || return 1
+    while IFS='=' read -r key val; do
+        case "$key" in
+            NOME)    cisco_nome="$val" ;;
+            PORTA)   cisco_porta="$val" ;;
+            DIR)     cisco_dir="$val" ;;
+            STEP)    cisco_step="$val" ;;
+            ORIGENS) cisco_origens="$val" ;;
+        esac
+    done < "$CISCO_REG_DIR/$slug.conf"
+    [[ -n "$cisco_nome" && -n "$cisco_porta" && -n "$cisco_dir" ]]
+}
+
+_cisco_reg_save() {
+    local slug="$1" file="$CISCO_REG_DIR/$slug.conf"
+    {
+        printf 'NOME=%s\n'    "$cisco_nome"
+        printf 'PORTA=%s\n'   "$cisco_porta"
+        printf 'DIR=%s\n'     "$cisco_dir"
+        printf 'STEP=%s\n'    "$cisco_step"
+        printf 'ORIGENS=%s\n' "$cisco_origens"
+    } > "$file"
+    chown root:adm "$file" 2>/dev/null
+    chmod 0640 "$file"
+}
+
+# Consulta o registro sem tocar nas variaveis de coleta em andamento.
+_cisco_porta_em_uso() {
+    grep -lx "PORTA=$1" "$CISCO_REG_DIR"/*.conf 2>/dev/null | head -1
+}
+
+_cisco_kit_get() {
+    local key="$1" def="$2" val=""
+    [[ -r "$CISCO_KIT_CONF" ]] && val=$(sed -n "s/^${key}=//p" "$CISCO_KIT_CONF" | tail -1)
+    printf '%s\n' "${val:-$def}"
+}
+
+_cisco_kit_instalado() {
+    [[ -x "$CISCO_HUNTER_BIN" && -d "$CISCO_REG_DIR" ]]
+}
+
+# -----------------------------------------------------------------------------
+# Coleta de dados
+# -----------------------------------------------------------------------------
+_cisco_coletar_kit() {
+    declare -g cisco_base_dir="/cgnat/log"
+    declare -g cisco_retencao="1830"
+    declare -g cisco_web_user="cgnat"
+    declare -g cisco_web_pwd=""
+    declare -g cisco_htpasswd="$CISCO_HTPASSWD"
+    declare -g -a cisco_web_origens=()
+
+    cisco_base_dir=$(whiptail --title "NetFlow Cisco - Armazenamento" \
+        --inputbox "Diretorio base dos coletores:\n\nCada equipamento ganha uma subpasta com o nome dele." 12 62 "/cgnat/log" \
+        3>&1 1>&2 2>&3) || return 1
+    [[ -z "$cisco_base_dir" ]] && cisco_base_dir="/cgnat/log"
+    if [[ "$cisco_base_dir" != /* ]]; then
+        whiptail --title "Erro" --msgbox "O diretorio precisa ser um caminho absoluto." 8 60
+        return 1
+    fi
+
+    cisco_retencao=$(whiptail --title "NetFlow Cisco - Retencao" \
+        --inputbox "Retencao dos arquivos, em dias:\n(1830 = 5 anos)" 11 60 "1830" \
+        3>&1 1>&2 2>&3) || return 1
+    if ! [[ "$cisco_retencao" =~ ^[0-9]+$ ]] || (( cisco_retencao < 1 )); then
+        whiptail --title "Erro" --msgbox "Retencao invalida: $cisco_retencao" 8 60
+        return 1
+    fi
+
+    # Reaproveitar o htpasswd do painel syslog evita duas senhas para a mesma
+    # equipe consultando o mesmo tipo de dado.
+    if [[ -f "$SYSLOG_HTPASSWD" ]]; then
+        cisco_htpasswd="$SYSLOG_HTPASSWD"
+        whiptail --title "NetFlow Cisco - Acesso web" --msgbox \
+"O painel syslog ja esta instalado neste servidor.
+
+O painel Cisco vai usar o MESMO usuario e senha:
+  ${SYSLOG_HTPASSWD}
+
+Trocar a senha em um painel troca nos dois." 13 66
+    else
+        whiptail --title "NetFlow Cisco - Acesso web" --msgbox \
+"Informe de onde a interface web pode ser acessada (rede da operacao,
+VPN, estacao do NOC).
+
+A consulta devolve qual assinante estava atras de um IP publico, que
+e dado pessoal - nao convem deixar a porta 80 aberta para qualquer um.
+Deixe vazio para finalizar." 14 68
+
+        _coletar_origens cisco_web_origens "NetFlow Cisco - Acesso web" \
+            "IP ou CIDR autorizado na interface web\n(deixe vazio para finalizar):"
+
+        cisco_web_user=$(whiptail --title "NetFlow Cisco - Acesso web" \
+            --inputbox "Usuario para acessar o CGNAT Hunter Cisco:" 10 60 "cgnat" \
+            3>&1 1>&2 2>&3) || return 1
+        if ! [[ "$cisco_web_user" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+            whiptail --title "Erro" --msgbox "Usuario invalido: $cisco_web_user" 8 60
+            return 1
+        fi
+
+        cisco_web_pwd=$(whiptail --title "NetFlow Cisco - Acesso web" \
+            --passwordbox "Senha para o usuario ${cisco_web_user}:" 10 60 \
+            3>&1 1>&2 2>&3) || return 1
+        if [[ ${#cisco_web_pwd} -lt 8 ]]; then
+            whiptail --title "Erro" --msgbox "A senha precisa ter ao menos 8 caracteres." 8 60
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+_cisco_coletar_equipamento() {
+    declare -g cisco_nome="" cisco_slug="" cisco_porta="" cisco_dir="" cisco_step="1" cisco_origens=""
+    declare -g -a cisco_equip_origens=()
+    local base_dir
+    base_dir=$(_cisco_kit_get BASE_DIR "/cgnat/log")
+
+    cisco_nome=$(whiptail --title "NetFlow Cisco - Equipamento" \
+        --inputbox "Nome do equipamento.\n\nE o ident do NetFlow (-I) e o nome da subpasta.\nEx.: ASR1002" 13 62 "ASR1002" \
+        3>&1 1>&2 2>&3) || return 1
+    if ! [[ "$cisco_nome" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        whiptail --title "Erro" --msgbox \
+"Nome invalido: ${cisco_nome}
+
+Use apenas letras, numeros, ponto, hifen e underscore." 10 62
+        return 1
+    fi
+
+    cisco_slug=$(printf '%s' "${cisco_nome,,}" | tr -c 'a-z0-9_-' '-')
+    if [[ -f "$CISCO_REG_DIR/$cisco_slug.conf" ]]; then
+        whiptail --title "Erro" --msgbox \
+"Ja existe um equipamento registrado como '${cisco_slug}'.
+
+Remova o existente antes de cadastrar outro com esse nome." 10 62
+        return 1
+    fi
+
+    local sugerida=2055 s p
+    for s in $(_cisco_reg_slugs); do
+        p=$(sed -n 's/^PORTA=//p' "$CISCO_REG_DIR/$s.conf" 2>/dev/null | tail -1)
+        [[ "$p" =~ ^[0-9]+$ ]] && (( p >= sugerida )) && sugerida=$(( p + 1 ))
+    done
+
+    cisco_porta=$(whiptail --title "NetFlow Cisco - Equipamento" \
+        --inputbox "Porta UDP de recepcao do NetFlow para ${cisco_nome}:" 10 62 "$sugerida" \
+        3>&1 1>&2 2>&3) || return 1
+    if ! [[ "$cisco_porta" =~ ^[0-9]+$ ]] || (( cisco_porta < 1 || cisco_porta > 65535 )); then
+        whiptail --title "Erro" --msgbox "Porta invalida: $cisco_porta" 8 60
+        return 1
+    fi
+
+    local dono
+    dono=$(_cisco_porta_em_uso "$cisco_porta")
+    if [[ -n "$dono" ]]; then
+        whiptail --title "Erro" --msgbox \
+"A porta ${cisco_porta} ja pertence ao equipamento:
+  $(basename "$dono" .conf)
+
+Cada caixa precisa de uma porta propria." 11 62
+        return 1
+    fi
+
+    if ss -lun 2>/dev/null | awk '{print $5}' | grep -q ":${cisco_porta}\$"; then
+        whiptail --title "NetFlow Cisco - Aviso" --yesno \
+"Ja existe processo escutando em ${cisco_porta}/udp neste servidor.
+
+Se nao for um coletor deste kit, o servico novo vai falhar ao subir.
+Prosseguir mesmo assim?" 12 66 || return 1
+    fi
+
+    # O hunter le o %pbstep de cada flow; este valor so entra quando o
+    # equipamento nao exporta o campo. Fixar 1 nesse caso esconde alocacao em
+    # caixa que aloca de N em N.
+    cisco_step=$(whiptail --title "NetFlow Cisco - Equipamento" \
+        --inputbox \
+"Salto (step) do bloco de portas de ${cisco_nome}:
+
+Usado apenas quando o equipamento nao exporta o campo pbstep.
+1 = bloco continuo." 14 66 "1" \
+        3>&1 1>&2 2>&3) || return 1
+    if ! [[ "$cisco_step" =~ ^[0-9]+$ ]] || (( cisco_step < 1 )); then
+        whiptail --title "Erro" --msgbox "Step invalido: $cisco_step" 8 60
+        return 1
+    fi
+
+    whiptail --title "NetFlow Cisco - Origens" --msgbox \
+"Informe os IPs ou blocos CIDR de ${cisco_nome} que exportam NetFlow.
+
+Somente essas origens serao liberadas em ${cisco_porta}/udp.
+Deixe vazio para finalizar." 12 66
+
+    _coletar_origens cisco_equip_origens "NetFlow Cisco - Origens" \
+        "IP ou CIDR de ${cisco_nome}\n(deixe vazio para finalizar):"
+
+    if [[ ${#cisco_equip_origens[@]} -eq 0 ]]; then
+        whiptail --title "NetFlow Cisco" --yesno \
+"Nenhuma origem informada.
+
+A porta ${cisco_porta}/udp ficaria aberta para qualquer host, o que permite injecao de flow forjado.
+
+Prosseguir mesmo assim?" 13 68 || return 1
+    fi
+
+    cisco_origens=$(IFS=,; printf '%s' "${cisco_equip_origens[*]}")
+    cisco_dir="${base_dir%/}/${cisco_slug}"
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Instalacao da base
+# -----------------------------------------------------------------------------
+_cisco_instalar_pacotes() {
+    # gawk pelo mesmo motivo do kit syslog; apache/php porque o painel web e
+    # servido daqui quando o kit syslog nao esta instalado.
+    local -a pkgs=(nfdump gawk apache2 apache2-utils php libapache2-mod-php)
+
+    echo "Instalando pacotes: ${pkgs[*]}"
+    apt update -qq
+    if ! apt install -y -o Dpkg::Options::="--force-confold" "${pkgs[@]}"; then
+        whiptail --title "Erro" --msgbox "Falha ao instalar os pacotes do kit NetFlow Cisco." 8 62
+        return 1
+    fi
+
+    # O pacote sobe um nfcapd generico proprio, que concorre pela porta e grava
+    # fora da arvore por equipamento.
+    systemctl disable --now nfdump.service >/dev/null 2>&1
+    return 0
+}
+
+_cisco_criar_usuario() {
+    if ! id -u "$CISCO_SVC_USER" >/dev/null 2>&1; then
+        if ! useradd --system --no-create-home --home-dir /nonexistent \
+                     --shell /usr/sbin/nologin "$CISCO_SVC_USER"; then
+            whiptail --title "Erro" --msgbox "Falha ao criar o usuario ${CISCO_SVC_USER}." 8 62
+            return 1
+        fi
+    fi
+    return 0
+}
+
+_cisco_sysctl() {
+    # O -B do nfcapd e um SO_RCVBUF, e processo sem privilegio fica limitado ao
+    # net.core.rmem_max - no padrao do Debian (~208 KB) bem abaixo do buffer
+    # pedido. Sem levantar o teto o kernel descarta NetFlow em silencio no pico,
+    # que e justamente o que nao pode acontecer em log com valor probatorio.
+    cat > /etc/sysctl.d/99-cgnat-cisco.conf <<'EOF'
+# Gerado por HUB-AUTOMACOES - coleta NetFlow CGNAT (nfcapd)
+net.core.rmem_max = 16777216
+EOF
+    chmod 0644 /etc/sysctl.d/99-cgnat-cisco.conf
+    sysctl -q -p /etc/sysctl.d/99-cgnat-cisco.conf >/dev/null 2>&1
+    return 0
+}
+
+_cisco_criar_dirs() {
+    local dir="$1" base
+    base=$(dirname "$dir")
+
+    mkdir -p "$base" || return 1
+    chmod 0755 "$base" 2>/dev/null
+
+    # setgid: as subpastas YYYY/MM/DD que o nfcapd cria herdam grupo adm e o
+    # proprio setgid. Sem isso o Apache perde a leitura na virada do dia.
+    install -d -o "$CISCO_SVC_USER" -g adm -m 2750 "$dir" || return 1
+    return 0
+}
+
+_cisco_criar_servico() {
+    local slug="$1" unit="/etc/systemd/system/nfcapd-${slug}.service" bin
+    bin=$(command -v nfcapd 2>/dev/null || printf '/usr/bin/nfcapd')
+
+    cat > "$unit" <<EOF
+[Unit]
+Description=Coletor NetFlow CGNAT - ${cisco_nome}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${CISCO_SVC_USER}
+Group=${CISCO_SVC_USER}
+UMask=0027
+ExecStart=${bin} -t 300 -S 1 -B 1024000 -z lz4 -I ${cisco_nome} -w ${cisco_dir} -p ${cisco_porta} -T all
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=${cisco_dir}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chmod 0644 "$unit"
+    systemctl daemon-reload
+    systemctl enable --now "nfcapd-${slug}.service" >/dev/null 2>&1
+
+    sleep 2
+    if ! systemctl is-active --quiet "nfcapd-${slug}.service"; then
+        whiptail --title "Erro - nfcapd" --msgbox \
+"O coletor nfcapd-${slug} nao subiu.
+
+Veja o detalhe com:
+  systemctl status nfcapd-${slug}
+  journalctl -u nfcapd-${slug} -n 30" 13 66
+        return 1
+    fi
+    return 0
+}
+
+_cisco_firewall_ativo() {
+    systemctl is-active --quiet netfilter-persistent 2>/dev/null ||
+        iptables -L INPUT -n 2>/dev/null | grep -q "DROP\|REJECT"
+}
+
+_cisco_firewall_equip() {
+    [[ -z "$cisco_origens" ]] && return 0
+
+    if ! _cisco_firewall_ativo; then
+        whiptail --title "NetFlow Cisco - Firewall" --msgbox \
+"Nenhum firewall ativo detectado. Nenhuma regra foi aplicada - a porta ${cisco_porta}/udp fica acessivel conforme a rede permitir.
+
+Use 'Firewall e Rede' no menu principal para montar o ruleset e depois reaplique." 13 68
+        return 0
+    fi
+
+    local src
+    local -a srcs=()
+    IFS=',' read -r -a srcs <<< "$cisco_origens"
+    for src in "${srcs[@]}"; do
+        [[ -z "$src" ]] && continue
+        if [[ "$src" == *:* ]]; then
+            ip6tables -A INPUT -p udp -s "$src" --dport "$cisco_porta" -j ACCEPT
+        else
+            iptables  -A INPUT -p udp -s "$src" --dport "$cisco_porta" -j ACCEPT
+        fi
+    done
+
+    netfilter-persistent save >/dev/null 2>&1
+    _hub_log INFO "netflow-cisco: liberadas ${#srcs[@]} origem(ns) em ${cisco_porta}/udp para ${cisco_nome}"
+    return 0
+}
+
+_cisco_firewall_remover_equip() {
+    local porta="$1" origens="$2" src
+    [[ -z "$origens" ]] && return 0
+    _cisco_firewall_ativo || return 0
+
+    local -a srcs=()
+    IFS=',' read -r -a srcs <<< "$origens"
+    for src in "${srcs[@]}"; do
+        [[ -z "$src" ]] && continue
+        if [[ "$src" == *:* ]]; then
+            ip6tables -D INPUT -p udp -s "$src" --dport "$porta" -j ACCEPT 2>/dev/null
+        else
+            iptables  -D INPUT -p udp -s "$src" --dport "$porta" -j ACCEPT 2>/dev/null
+        fi
+    done
+
+    netfilter-persistent save >/dev/null 2>&1
+    return 0
+}
+
+_cisco_firewall_web() {
+    [[ ${#cisco_web_origens[@]} -eq 0 ]] && return 0
+    _cisco_firewall_ativo || return 0
+
+    local src
+    for src in "${cisco_web_origens[@]}"; do
+        if [[ "$src" == *:* ]]; then
+            ip6tables -A INPUT -p tcp -s "$src" --dport 80 -j ACCEPT
+        else
+            iptables  -A INPUT -p tcp -s "$src" --dport 80 -j ACCEPT
+        fi
+    done
+
+    netfilter-persistent save >/dev/null 2>&1
+    _hub_log INFO "netflow-cisco: liberadas ${#cisco_web_origens[@]} origem(ns) em 80/tcp"
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Expiracao
+#
+# O -t 300 ja rotaciona (arquivo novo a cada 5 min); o que falta e expirar. Como
+# logrotate nao trata arvore de nfcapd, a limpeza e por timer proprio.
+# -----------------------------------------------------------------------------
+_cisco_instalar_expire() {
+    cat > "$CISCO_EXPIRE_BIN" <<'EXPIREEOF'
+#!/bin/bash
+# =============================================================================
+# cgnat-cisco-expire
+#
+# Apaga os arquivos de NetFlow que passaram da retencao e limpa as pastas de
+# data que ficaram vazias. Gerado por HUB-AUTOMACOES.
+# =============================================================================
+
+set -uo pipefail
+
+REG_DIR="@@REG_DIR@@"
+KIT_CONF="@@KIT_CONF@@"
+
+RETENCAO=1830
+if [[ -r "$KIT_CONF" ]]; then
+    _v=$(sed -n 's/^RETENCAO=//p' "$KIT_CONF" | tail -1)
+    [[ "$_v" =~ ^[0-9]+$ ]] && (( _v >= 1 )) && RETENCAO="$_v"
+fi
+
+total=0
+for conf in "$REG_DIR"/*.conf; do
+    [[ -f "$conf" ]] || continue
+    dir=$(sed -n 's/^DIR=//p' "$conf" | tail -1)
+    [[ -n "$dir" && -d "$dir" ]] || continue
+
+    n=$(find "$dir" -type f -name 'nfcapd.*' -mtime "+${RETENCAO}" -print -delete 2>/dev/null | wc -l)
+    find "$dir" -mindepth 1 -type d -empty -delete 2>/dev/null
+
+    total=$(( total + n ))
+    printf 'expire: %s -> %s arquivo(s) acima de %s dias\n' "$(basename "$conf" .conf)" "$n" "$RETENCAO"
+done
+
+printf 'expire: total %s arquivo(s) removido(s)\n' "$total"
+EXPIREEOF
+
+    sed -i "s|@@REG_DIR@@|${CISCO_REG_DIR}|g; s|@@KIT_CONF@@|${CISCO_KIT_CONF}|g" "$CISCO_EXPIRE_BIN"
+    chmod 0750 "$CISCO_EXPIRE_BIN"
+    chown root:root "$CISCO_EXPIRE_BIN"
+
+    cat > /etc/systemd/system/cgnat-cisco-expire.service <<EOF
+[Unit]
+Description=Expiracao dos coletores NetFlow CGNAT
+
+[Service]
+Type=oneshot
+ExecStart=${CISCO_EXPIRE_BIN}
+EOF
+
+    cat > /etc/systemd/system/cgnat-cisco-expire.timer <<'EOF'
+[Unit]
+Description=Expiracao diaria dos coletores NetFlow CGNAT
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    chmod 0644 /etc/systemd/system/cgnat-cisco-expire.service \
+               /etc/systemd/system/cgnat-cisco-expire.timer
+    systemctl daemon-reload
+    systemctl enable --now cgnat-cisco-expire.timer >/dev/null 2>&1
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Hunter (CLI)
+# -----------------------------------------------------------------------------
+_cisco_instalar_hunter() {
+    cat > "$CISCO_HUNTER_BIN" <<'HUNTEREOF'
+#!/bin/bash
+# =============================================================================
+# cgnat-hunter-cisco
+#
+# Localiza a alocacao CGNAT (IP publico + porta -> IP privado) sobre NetFlow/NEL
+# de Cisco ASR coletado com nfcapd. Gerado por HUB-AUTOMACOES.
+#
+# Uso:  cgnat-hunter-cisco <data_inicio> <data_fim> <ip_publico> [porta] [equipamento]
+#       cgnat-hunter-cisco            (sem argumentos = modo interativo)
+# =============================================================================
+
+set -uo pipefail
+
+REG_DIR="@@REG_DIR@@"
+
+GREEN='\033[0;32m'; RED='\033[0;31m'; BLUE='\033[0;34m'
+YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+
+INTERACTIVE=0
+[[ $# -eq 0 ]] && INTERACTIVE=1
+
+# -----------------------------------------------------------------------------
+# Validacao de entrada
+# -----------------------------------------------------------------------------
+_valida_data() {
+    [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    date -d "$1" >/dev/null 2>&1
+}
+
+_valida_ip() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local a b c d o
+    IFS=. read -r a b c d <<< "$1"
+    for o in "$a" "$b" "$c" "$d"; do
+        (( 10#$o <= 255 )) || return 1
+    done
+    return 0
+}
+
+_valida_porta() {
+    [[ -z "$1" ]] && return 0
+    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+# -----------------------------------------------------------------------------
+# 1. Entrada
+# -----------------------------------------------------------------------------
+if [[ $# -ge 3 ]]; then
+    START_DATE="$1"
+    END_DATE="$2"
+    TARGET_IP="$3"
+    TARGET_PORT="${4:-}"
+    TARGET_EQUIP="${5:-}"
+    [[ -z "$END_DATE" ]] && END_DATE="$START_DATE"
+elif [[ $INTERACTIVE -eq 1 ]]; then
+    echo ""
+    echo -e "${BLUE}================================================================${NC}"
+    echo -e "${CYAN}   CGNAT HUNTER - CISCO ASR (NetFlow)   ${NC}"
+    echo -e "${BLUE}================================================================${NC}"
+
+    echo -ne "Data INICIAL (YYYY-MM-DD) [Hoje]: "
+    read -r START_DATE
+    START_DATE=${START_DATE:-$(date +%Y-%m-%d)}
+
+    echo -ne "Data FINAL   (YYYY-MM-DD) [Igual Inicio]: "
+    read -r END_DATE
+    END_DATE=${END_DATE:-$START_DATE}
+
+    TARGET_IP=""
+    while [[ -z "$TARGET_IP" ]]; do
+        echo -ne "IP Publico Alvo (Ex: 143.137.10.20): "
+        read -r TARGET_IP
+        [[ -z "$TARGET_IP" ]] && echo -e "${RED}Erro: o IP e obrigatorio.${NC}"
+    done
+
+    echo -ne "Porta Alvo (Enter para ver TUDO): "
+    read -r TARGET_PORT
+
+    echo -ne "Equipamento (Enter para TODOS): "
+    read -r TARGET_EQUIP
+else
+    echo -e "${RED}Uso: $(basename "$0") <data_inicio> <data_fim> <ip> [porta] [equipamento]${NC}" >&2
+    exit 2
+fi
+
+_valida_data  "$START_DATE"  || { echo -e "${RED}Data inicial invalida: ${START_DATE}${NC}" >&2; exit 1; }
+_valida_data  "$END_DATE"    || { echo -e "${RED}Data final invalida: ${END_DATE}${NC}" >&2; exit 1; }
+_valida_ip    "$TARGET_IP"   || { echo -e "${RED}IP publico invalido: ${TARGET_IP}${NC}" >&2; exit 1; }
+_valida_porta "$TARGET_PORT" || { echo -e "${RED}Porta invalida: ${TARGET_PORT}${NC}" >&2; exit 1; }
+
+if [[ $(date -d "$START_DATE" +%Y%m%d) -gt $(date -d "$END_DATE" +%Y%m%d) ]]; then
+    echo -e "${RED}Erro: a data inicial e posterior a data final.${NC}" >&2
+    exit 1
+fi
+
+if [[ -n "$TARGET_EQUIP" ]] && ! [[ "$TARGET_EQUIP" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo -e "${RED}Nome de equipamento invalido: ${TARGET_EQUIP}${NC}" >&2
+    exit 1
+fi
+
+if ! command -v nfdump >/dev/null 2>&1; then
+    echo -e "${RED}Erro: nfdump nao encontrado. Instale com: apt install nfdump${NC}" >&2
+    exit 1
+fi
+
+AWK_BIN=""
+for _cand in gawk awk; do
+    command -v "$_cand" >/dev/null 2>&1 && { AWK_BIN="$_cand"; break; }
+done
+[[ -z "$AWK_BIN" ]] && { echo -e "${RED}Erro: awk nao encontrado.${NC}" >&2; exit 1; }
+
+# -----------------------------------------------------------------------------
+# 2. Equipamentos
+#    Sem filtro explicito varre todos: uma caixa nova nao pode ficar invisivel
+#    para a busca.
+# -----------------------------------------------------------------------------
+declare -a EQ_NOME=() EQ_DIR=() EQ_STEP=()
+
+for conf in "$REG_DIR"/*.conf; do
+    [[ -f "$conf" ]] || continue
+    slug=$(basename "$conf" .conf)
+    nome=""; dir=""; step=""
+    while IFS='=' read -r k v; do
+        case "$k" in
+            NOME) nome="$v" ;;
+            DIR)  dir="$v"  ;;
+            STEP) step="$v" ;;
+        esac
+    done < "$conf"
+
+    [[ -n "$dir" ]] || continue
+    [[ -n "$nome" ]] || nome="$slug"
+    [[ "$step" =~ ^[0-9]+$ ]] && (( step >= 1 )) || step=1
+
+    if [[ -n "$TARGET_EQUIP" ]]; then
+        [[ "${TARGET_EQUIP,,}" == "$slug" || "${TARGET_EQUIP,,}" == "${nome,,}" ]] || continue
+    fi
+
+    EQ_NOME+=("$nome"); EQ_DIR+=("$dir"); EQ_STEP+=("$step")
+done
+
+if [[ ${#EQ_NOME[@]} -eq 0 ]]; then
+    if [[ -n "$TARGET_EQUIP" ]]; then
+        echo -e "${RED}Equipamento nao registrado: ${TARGET_EQUIP}${NC}" >&2
+    else
+        echo -e "${RED}Nenhum equipamento registrado em ${REG_DIR}.${NC}" >&2
+    fi
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# 3. Selecao de arquivos
+#    O nfcapd grava em <dir>/YYYY/MM/DD/nfcapd.YYYYMMDDHHMM. O dia da pasta e o
+#    dia do proprio arquivo, entao a janela e a faixa de datas pedida.
+# -----------------------------------------------------------------------------
+declare -a FILES=() FILE_EQ=() FILE_STEP=()
+LIM=$(date -d "$END_DATE" +%Y%m%d)
+
+for i in "${!EQ_NOME[@]}"; do
+    cursor="$START_DATE"
+    while :; do
+        dia=$(date -d "$cursor" +%Y%m%d)
+        (( 10#$dia > 10#$LIM )) && break
+
+        daydir="${EQ_DIR[$i]}/$(date -d "$cursor" +%Y/%m/%d)"
+        if [[ -d "$daydir" ]]; then
+            for f in "$daydir"/nfcapd."${dia}"*; do
+                [[ -f "$f" ]] || continue
+                FILES+=("$f")
+                FILE_EQ+=("${EQ_NOME[$i]}")
+                FILE_STEP+=("${EQ_STEP[$i]}")
+            done
+        fi
+
+        cursor=$(date -d "$cursor +1 day" +%Y-%m-%d)
+    done
+done
+
+if [[ ${#FILES[@]} -eq 0 ]]; then
+    # "Nao existe log do periodo" e resposta diferente de "nao houve alocacao",
+    # e quem responde oficio precisa conseguir distinguir as duas.
+    echo -e "${RED}Nenhum arquivo de NetFlow cobre o periodo ${START_DATE} a ${END_DATE}" \
+            "para: ${EQ_NOME[*]}.${NC}" >&2
+    exit 1
+fi
+
+if [[ $INTERACTIVE -eq 1 ]]; then
+    echo ""
+    echo -e "${YELLOW}>>> ${#FILES[@]} arquivo(s) na janela, ${#EQ_NOME[@]} equipamento(s).${NC}"
+    echo -e "${YELLOW}>>> INICIANDO LEITURA...${NC}"
+    printf "%-24s %-12s %-6s %-16s %-16s %-11s %-17s %s\n" \
+           "Data/Hora" "Event" "Proto" "IP Privado" "IP Publico" "Porta Alvo" "Range Bloco" "Equipamento"
+    echo "-----------------------------------------------------------------------------------------------------------------"
+fi
+
+# -----------------------------------------------------------------------------
+# 4. Busca
+#
+#    O grep e so pre-filtro barato; quem decide e o awk, comparando o IP publico
+#    campo a campo (o grep casaria 100.64.1.2 dentro de 100.64.1.20).
+#
+#    Bloco de portas: fim = inicio + (size * step) - 1. Com porta alvo, alem de
+#    cair no range ela precisa estar no salto - em alocacao nao continua as
+#    portas intermediarias pertencem a outro assinante.
+# -----------------------------------------------------------------------------
+for i in "${!FILES[@]}"; do
+    nfdump -r "${FILES[$i]}" -o "fmt:%tr %evt %pr %sa %nsa %pbstart %pbstep %pbsize" 2>/dev/null |
+        grep -aF -e "$TARGET_IP" |
+        "$AWK_BIN" -v t_ip="$TARGET_IP" \
+                   -v t_port="$TARGET_PORT" \
+                   -v def_step="${FILE_STEP[$i]}" \
+                   -v equip="${FILE_EQ[$i]}" '
+    {
+        timestamp = $1 " " $2
+        evt       = $3
+        proto     = $4
+        priv_ip   = $5
+        pub_ip    = $6
+        pstart    = $7 + 0
+        step      = $8 + 0
+        size      = $9 + 0
+
+        # Equipamento que nao exporta pbstep cai no valor cadastrado no registro.
+        if (step <= 0) step = def_step + 0
+        if (step <= 0) step = 1
+
+        if (pstart <= 0 || pub_ip != t_ip) next
+
+        pend = pstart + (size * step) - 1
+
+        show = 0
+        if (t_port == "") {
+            show = 1
+        } else {
+            p = t_port + 0
+            if (p >= pstart && p <= pend && (p - pstart) % step == 0) show = 1
+        }
+
+        if (show) {
+            color = "\033[0m"
+            if (evt ~ /ADD|Create|CREATE|BUILD/)          color = "\033[0;32m"
+            if (evt ~ /DEL|Delete|DELETE|Teardown/)       color = "\033[0;31m"
+
+            t_port_display = (t_port == "") ? "-" : t_port
+
+            printf "%-24s %s%-12s\033[0m %-6s %-16s %-16s %-11s %-17s %s\n", \
+                   timestamp, color, evt, proto, priv_ip, pub_ip, \
+                   t_port_display, pstart "-" pend, equip
+        }
+    }'
+done
+
+if [[ $INTERACTIVE -eq 1 ]]; then
+    echo -e "${BLUE}================================================================${NC}"
+    echo -e "Busca finalizada."
+fi
+HUNTEREOF
+
+    sed -i "s|@@REG_DIR@@|${CISCO_REG_DIR}|g" "$CISCO_HUNTER_BIN"
+    chmod 0755 "$CISCO_HUNTER_BIN"
+    chown root:root "$CISCO_HUNTER_BIN"
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Hunter (web)
+# -----------------------------------------------------------------------------
+_cisco_instalar_web_hunter() {
+    mkdir -p "$CISCO_WEB_DIR"
+
+    cat > "$CISCO_WEB_DIR/index.php" <<'PHPEOF'
+<?php
+// =============================================================================
+// CGNAT HUNTER WEB - CISCO ASR (NetFlow)
+// Interface para /usr/local/bin/cgnat-hunter-cisco
+// Gerado por HUB-AUTOMACOES.
+// =============================================================================
+
+// A busca varre anos de log; o max_execution_time padrao mataria a consulta no
+// meio do streaming.
+set_time_limit(0);
+ignore_user_abort(false);
+while (ob_get_level() > 0) { ob_end_flush(); }
+ob_implicit_flush(true);
+
+const HUNTER_BIN = '/usr/local/bin/cgnat-hunter-cisco';
+const REG_DIR    = '@@REG_DIR@@';
+const AUDIT_LOG  = '@@AUDIT_LOG@@';
+
+// A lista vem do registro, entao um equipamento novo aparece no painel sem
+// precisar reeditar esta pagina.
+function equipamentos(): array {
+    $out = [];
+    foreach (glob(REG_DIR . '/*.conf') ?: [] as $f) {
+        $slug = basename($f, '.conf');
+        $nome = $slug;
+        foreach (file($f, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $l) {
+            if (strncmp($l, 'NOME=', 5) === 0) { $nome = substr($l, 5); }
+        }
+        $out[$slug] = $nome;
+    }
+    ksort($out);
+    return $out;
+}
+
+$equipamentos = equipamentos();
+
+$dataInicio = $_GET['data_inicio'] ?? date('Y-m-d');
+$dataFim    = $_GET['data_fim']    ?? date('Y-m-d');
+$ipAlvo     = $_GET['ip']          ?? '';
+$portaAlvo  = $_GET['porta']       ?? '';
+$equipAlvo  = $_GET['equip']       ?? '';
+$buscar     = isset($_GET['buscar']);
+
+$erros = [];
+
+function valida_data(string $d): bool {
+    $dt = DateTime::createFromFormat('Y-m-d', $d);
+    return $dt !== false && $dt->format('Y-m-d') === $d;
+}
+
+// Validacao estrita na entrada. O backend monta os caminhos a partir do
+// registro e de date(), entao nao ha travessia possivel, mas validar aqui evita
+// que lixo chegue ao shell e da mensagem de erro util em vez de vazio.
+if ($buscar) {
+    if (!valida_data($dataInicio))                  { $erros[] = 'Data inicial invalida.'; }
+    if (!valida_data($dataFim))                     { $erros[] = 'Data final invalida.'; }
+    if (!filter_var($ipAlvo, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        $erros[] = 'IP publico invalido.';
+    }
+    if ($portaAlvo !== '' &&
+        filter_var($portaAlvo, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 65535]]) === false) {
+        $erros[] = 'Porta invalida (1-65535).';
+    }
+    if ($equipAlvo !== '' && !array_key_exists($equipAlvo, $equipamentos)) {
+        $erros[] = 'Equipamento nao registrado.';
+    }
+    if (!$erros && valida_data($dataInicio) && valida_data($dataFim) && $dataInicio > $dataFim) {
+        $erros[] = 'A data inicial e posterior a data final.';
+    }
+}
+
+// Trilha de auditoria: consulta de CGNAT expoe dado pessoal, entao quem
+// consultou o que precisa ficar registrado.
+function auditar(string $usuario, string $ip, array $params): void {
+    $linha = sprintf(
+        "%s\t%s\t%s\t%s\n",
+        date('c'),
+        $usuario,
+        $ip,
+        json_encode($params, JSON_UNESCAPED_SLASHES)
+    );
+    @file_put_contents(AUDIT_LOG, $linha, FILE_APPEND | LOCK_EX);
+}
+
+// Converte as cores ANSI do backend para HTML. O escape de HTML acontece ANTES:
+// a linha vem de dado exportado por equipamento externo.
+function colorize_log(string $line): string {
+    $line = htmlspecialchars($line, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+
+    $replacements = [
+        '/\e\[0;31m/' => '<span style="color: #ff6b6b;">',
+        '/\e\[0;32m/' => '<span style="color: #51cf66;">',
+        '/\e\[0;34m/' => '<span style="color: #339af0;">',
+        '/\e\[1;33m/' => '<span style="color: #fcc419;">',
+        '/\e\[0;36m/' => '<span style="color: #66d9e8;">',
+        '/\e\[0m/'    => '</span>',
+    ];
+    $line = preg_replace(array_keys($replacements), array_values($replacements), $line);
+
+    return preg_replace('/\e\[[0-9;]*m/', '', $line);
+}
+
+function h(?string $v): string {
+    return htmlspecialchars((string) $v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+?>
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CGNAT Hunter - Cisco</title>
+    <style>
+        body { background-color: #f0f2f5; padding: 20px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        h2 { border-bottom: 2px solid #eee; padding-bottom: 15px; margin-top: 0; color: #333; }
+        .form-row { display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap; }
+        .form-group { flex: 1; min-width: 160px; }
+        label { display: block; margin-bottom: 8px; font-weight: 600; color: #555; }
+        input, select {
+            width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 4px;
+            box-sizing: border-box; font-size: 14px; transition: border-color 0.3s;
+            background: white;
+        }
+        input:focus, select:focus { border-color: #007bff; outline: none; }
+        button {
+            width: 100%; padding: 14px; background: #28a745; color: white; border: none;
+            border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 16px;
+            transition: background 0.2s;
+        }
+        button:hover { background: #218838; }
+        .erro { background: #fff5f5; border: 1px solid #ffc9c9; color: #c92a2a;
+                padding: 12px 16px; border-radius: 4px; margin-bottom: 20px; }
+        .erro ul { margin: 6px 0 0; padding-left: 20px; }
+        .terminal-window {
+            background-color: #1e1e1e; color: #d4d4d4; padding: 20px; border-radius: 6px;
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            font-size: 14px; line-height: 1.5; overflow-x: auto; white-space: pre;
+            border: 1px solid #333; margin-top: 25px; min-height: 150px;
+            box-shadow: inset 0 0 10px rgba(0,0,0,0.5);
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>&#128373; CGNAT Hunter &mdash; Cisco ASR</h2>
+
+    <?php if (!$equipamentos): ?>
+        <div class="erro">
+            Nenhum equipamento registrado. Cadastre uma caixa pelo HUB-AUTOMACOES
+            (Monitoramento &rarr; NetFlow CGNAT Cisco &rarr; Adicionar equipamento).
+        </div>
+    <?php endif; ?>
+
+    <?php if ($erros): ?>
+        <div class="erro">
+            <strong>Corrija antes de buscar:</strong>
+            <ul><?php foreach ($erros as $e) { echo '<li>' . h($e) . '</li>'; } ?></ul>
+        </div>
+    <?php endif; ?>
+
+    <form method="GET">
+        <div class="form-row">
+            <div class="form-group">
+                <label>Data Inicio</label>
+                <input type="date" name="data_inicio" value="<?php echo h($dataInicio); ?>" required>
+            </div>
+            <div class="form-group">
+                <label>Data Fim</label>
+                <input type="date" name="data_fim" value="<?php echo h($dataFim); ?>" required>
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group" style="flex: 2;">
+                <label>IP Publico (Alvo)</label>
+                <input type="text" name="ip" placeholder="Ex: 143.137.10.20" value="<?php echo h($ipAlvo); ?>" required>
+            </div>
+            <div class="form-group">
+                <label>Porta (Opcional)</label>
+                <input type="number" name="porta" min="1" max="65535" placeholder="Vazio = Tudo" value="<?php echo h($portaAlvo); ?>">
+            </div>
+            <div class="form-group">
+                <label>Equipamento</label>
+                <select name="equip">
+                    <option value="">Todos</option>
+                    <?php foreach ($equipamentos as $slug => $nome): ?>
+                        <option value="<?php echo h($slug); ?>" <?php echo $equipAlvo === $slug ? 'selected' : ''; ?>>
+                            <?php echo h($nome); ?>
+                        </option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+        </div>
+
+        <button type="submit" name="buscar" value="true">&#128269; Rastrear Conexoes</button>
+    </form>
+
+    <?php if ($buscar && !$erros): ?>
+        <h4 style="margin-bottom: 10px; color: #333; margin-top: 30px;">Resultado:</h4>
+        <div class="terminal-window">
+<?php
+        $usuario = $_SERVER['PHP_AUTH_USER'] ?? ($_SERVER['REMOTE_USER'] ?? 'desconhecido');
+        auditar($usuario, $_SERVER['REMOTE_ADDR'] ?? '-', [
+            'inicio' => $dataInicio,
+            'fim'    => $dataFim,
+            'ip'     => $ipAlvo,
+            'porta'  => $portaAlvo,
+            'equip'  => $equipAlvo,
+        ]);
+
+        $cmd = HUNTER_BIN
+             . ' ' . escapeshellarg($dataInicio)
+             . ' ' . escapeshellarg($dataFim)
+             . ' ' . escapeshellarg($ipAlvo)
+             . ' ' . escapeshellarg($portaAlvo)
+             . ' ' . escapeshellarg($equipAlvo)
+             . ' 2>&1';
+
+        $handle = popen($cmd, 'r');
+
+        if ($handle) {
+            printf(
+                "<span style='color:#66d9e8'>%-24s %-12s %-6s %-16s %-16s %-11s %-17s %s</span>\n",
+                'Data/Hora', 'Event', 'Proto', 'IP Privado', 'IP Publico', 'Porta Alvo', 'Range Bloco', 'Equipamento'
+            );
+            echo str_repeat('-', 113) . "\n";
+
+            $linhas = 0;
+            while (($line = fgets($handle)) !== false) {
+                echo colorize_log($line);
+                flush();
+                $linhas++;
+            }
+            pclose($handle);
+
+            if ($linhas === 0) {
+                echo "\n<span style='color: #fcc419;'>Nenhuma alocacao encontrada para esse IP no periodo.</span>";
+            }
+        } else {
+            echo "<span style='color: #ff6b6b;'>Erro ao executar o backend de busca.</span>";
+        }
+?>
+        </div>
+    <?php endif; ?>
+</div>
+
+</body>
+</html>
+PHPEOF
+
+    sed -i "s|@@REG_DIR@@|${CISCO_REG_DIR}|g; s|@@AUDIT_LOG@@|${CISCO_AUDIT_LOG}|g" \
+        "$CISCO_WEB_DIR/index.php"
+
+    touch "$CISCO_AUDIT_LOG"
+    chown www-data:adm "$CISCO_AUDIT_LOG"
+    chmod 0640 "$CISCO_AUDIT_LOG"
+
+    chown -R www-data:www-data "$CISCO_WEB_DIR"
+    chmod 0755 "$CISCO_WEB_DIR"
+    chmod 0644 "$CISCO_WEB_DIR/index.php"
+
+    # O Apache le o NetFlow pelo grupo adm, que e o grupo das pastas de cada
+    # equipamento - nao por chmod nos arquivos, que so alcancaria o que ja
+    # existe e deixaria o log legivel por qualquer usuario local.
+    usermod -aG adm www-data
+
+    # Quando o painel syslog ja existe, o htpasswd e o mesmo: uma equipe, uma
+    # senha, para o mesmo tipo de dado.
+    if [[ "$cisco_htpasswd" == "$CISCO_HTPASSWD" ]]; then
+        # -i le a senha do stdin: com -b ela apareceria na lista de processos.
+        printf '%s' "$cisco_web_pwd" | htpasswd -ci "$CISCO_HTPASSWD" "$cisco_web_user" >/dev/null 2>&1
+        chown root:www-data "$CISCO_HTPASSWD"
+        chmod 0640 "$CISCO_HTPASSWD"
+    fi
+
+    cat > /etc/apache2/conf-available/cgnat-hunter-cisco.conf <<EOF
+<Directory ${CISCO_WEB_DIR}>
+    AuthType Basic
+    AuthName "CGNAT Hunter Cisco - acesso restrito"
+    AuthUserFile ${cisco_htpasswd}
+    Require valid-user
+</Directory>
+EOF
+
+    a2enconf cgnat-hunter-cisco >/dev/null 2>&1
+    a2enmod auth_basic authn_file authz_user >/dev/null 2>&1
+
+    if ! apache2ctl configtest >/dev/null 2>&1; then
+        whiptail --title "Erro - Apache" --msgbox \
+"A configuracao do Apache nao passou no teste.
+Rode 'apache2ctl configtest' para ver o detalhe." 10 65
+        return 1
+    fi
+
+    systemctl enable --now apache2
+    systemctl restart apache2
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Fluxos do menu
+# -----------------------------------------------------------------------------
+_cisco_add_equipamento_flow() {
+    _cisco_reg_init
+    _cisco_coletar_equipamento || return 1
+
+    local resumo="Confirma o cadastro do equipamento?\n\n"
+    resumo+="  Nome:     ${cisco_nome}\n"
+    resumo+="  Porta:    ${cisco_porta}/udp\n"
+    resumo+="  Pasta:    ${cisco_dir}\n"
+    resumo+="  Step:     ${cisco_step} (fallback)\n"
+    resumo+="  Origens:  ${#cisco_equip_origens[@]}\n"
+
+    whiptail --title "NetFlow Cisco - Confirmacao" --yesno "$resumo" 16 66 || return 1
+
+    _hub_log INFO "netflow-cisco: cadastrando ${cisco_nome} em ${cisco_porta}/udp"
+
+    _cisco_criar_dirs "$cisco_dir" || {
+        whiptail --title "Erro" --msgbox "Falha ao preparar ${cisco_dir}." 8 62
+        return 1
+    }
+    _cisco_criar_servico "$cisco_slug" || return 1
+    _cisco_firewall_equip
+    _cisco_reg_save "$cisco_slug"
+
+    _hub_log INFO "netflow-cisco: ${cisco_nome} cadastrado"
+    return 0
+}
+
+fn_cisco_netflow() {
+    if _cisco_kit_instalado; then
+        whiptail --title "NetFlow Cisco" --yesno \
+"O kit ja esta instalado neste servidor.
+
+Reinstalar recria o hunter, o painel web e o timer de expiracao. Os
+equipamentos cadastrados e os logs nao sao tocados.
+
+Prosseguir?" 14 68 || return 1
+    fi
+
+    _cisco_coletar_kit || return 1
+
+    local resumo="Confirma a instalacao do kit?\n\n"
+    resumo+="  Diretorio base: ${cisco_base_dir}\n"
+    resumo+="  Retencao:       ${cisco_retencao} dias\n"
+    resumo+="  Coletor:        nfcapd (usuario ${CISCO_SVC_USER})\n"
+    resumo+="  Painel:         ${CISCO_WEB_DIR}\n"
+    if [[ "$cisco_htpasswd" == "$SYSLOG_HTPASSWD" ]]; then
+        resumo+="  Credencial:     reaproveitada do painel syslog\n"
+    else
+        resumo+="  Usuario web:    ${cisco_web_user}\n"
+        resumo+="  Origens web:    ${#cisco_web_origens[@]}\n"
+    fi
+
+    whiptail --title "NetFlow Cisco - Confirmacao" --yesno "$resumo" 17 68 || return 1
+
+    _hub_log INFO "netflow-cisco: iniciando instalacao do kit"
+
+    _cisco_instalar_pacotes || return 1
+    _cisco_criar_usuario    || return 1
+    _cisco_sysctl
+
+    _cisco_reg_init
+    {
+        printf 'BASE_DIR=%s\n' "${cisco_base_dir%/}"
+        printf 'RETENCAO=%s\n' "$cisco_retencao"
+    } > "$CISCO_KIT_CONF"
+    chmod 0644 "$CISCO_KIT_CONF"
+
+    _cisco_instalar_hunter     || return 1
+    _cisco_instalar_web_hunter || return 1
+    _cisco_instalar_expire     || return 1
+    _cisco_firewall_web
+
+    whiptail --title "NetFlow Cisco" --msgbox \
+"Base instalada.
+
+Cadastre agora o primeiro equipamento: nome, porta UDP e as origens
+que exportam NetFlow." 12 68
+
+    _cisco_add_equipamento_flow || {
+        whiptail --title "NetFlow Cisco" --msgbox \
+"A base ficou instalada, mas nenhum equipamento foi cadastrado.
+
+Use 'Adicionar equipamento' no mesmo menu quando quiser." 11 68
+        return 1
+    }
+
+    detectar_ips
+    local ip_acesso
+    ip_acesso=$(_syslog_ip_acesso)
+
+    local final="Kit NetFlow CGNAT Cisco instalado.\n\n"
+    final+="Coleta:   ${cisco_porta}/udp -> ${cisco_dir}/AAAA/MM/DD/\n"
+    final+="Arquivo:  novo a cada 5 min, comprimido em lz4\n"
+    final+="Expira:   ${cisco_retencao} dias (timer cgnat-cisco-expire)\n"
+    final+="Hunter:   http://${ip_acesso}/cgnat_hunter_cisco/\n"
+    final+="CLI:      ${CISCO_HUNTER_BIN}\n"
+    final+="\nAuditoria de consultas: ${CISCO_AUDIT_LOG}\n"
+    final+="\nFalta o lado do roteador: exportar NAT translations em\n"
+    final+="NetFlow v9 para este servidor na porta ${cisco_porta}.\n"
+
+    whiptail --title "Concluido" --msgbox "$final" 20 72
+    _hub_log INFO "netflow-cisco: kit instalado com sucesso"
+    return 0
+}
+
+fn_cisco_adicionar_equipamento() {
+    if ! _cisco_kit_instalado; then
+        whiptail --title "NetFlow Cisco" --msgbox \
+"O kit ainda nao foi instalado neste servidor.
+
+Use 'Instalar kit' antes de adicionar equipamentos." 11 66
+        return 1
+    fi
+
+    _cisco_add_equipamento_flow || return 1
+
+    local final="Equipamento cadastrado.\n\n"
+    final+="  Nome:    ${cisco_nome}\n"
+    final+="  Coleta:  ${cisco_porta}/udp -> ${cisco_dir}/AAAA/MM/DD/\n"
+    final+="  Servico: nfcapd-${cisco_slug}.service\n"
+    final+="\nO painel web ja lista este equipamento.\n"
+    final+="\nFalta o lado do roteador: exportar NAT translations em\n"
+    final+="NetFlow v9 para este servidor na porta ${cisco_porta}.\n"
+
+    whiptail --title "Concluido" --msgbox "$final" 17 70
+    return 0
+}
+
+fn_cisco_remover_equipamento() {
+    _cisco_reg_init
+
+    local -a itens=() slugs=()
+    local s
+    for s in $(_cisco_reg_slugs); do
+        _cisco_reg_load "$s" || continue
+        slugs+=("$s")
+        itens+=("$s" "${cisco_nome} - ${cisco_porta}/udp")
+    done
+
+    if [[ ${#slugs[@]} -eq 0 ]]; then
+        whiptail --title "NetFlow Cisco" --msgbox "Nenhum equipamento cadastrado." 8 60
+        return 1
+    fi
+
+    local alvo
+    alvo=$(whiptail --title "NetFlow Cisco - Remover" --cancel-button "Voltar" \
+        --menu "Selecione o equipamento:" 18 66 8 "${itens[@]}" \
+        3>&1 1>&2 2>&3) || return 0
+
+    _cisco_reg_load "$alvo" || return 1
+
+    whiptail --title "NetFlow Cisco - Remover" --yesno \
+"Remover o equipamento ${cisco_nome}?
+
+Para o coletor, apaga o servico e retira as regras de firewall de
+${cisco_porta}/udp.
+
+Os logs em ${cisco_dir} sao preservados." 15 68 || return 0
+
+    systemctl disable --now "nfcapd-${alvo}.service" >/dev/null 2>&1
+    rm -f "/etc/systemd/system/nfcapd-${alvo}.service"
+    systemctl daemon-reload
+
+    _cisco_firewall_remover_equip "$cisco_porta" "$cisco_origens"
+    rm -f "$CISCO_REG_DIR/$alvo.conf"
+
+    _hub_log INFO "netflow-cisco: ${cisco_nome} removido (logs preservados em ${cisco_dir})"
+
+    # O apagamento do acervo fica em pergunta separada e com resposta padrao
+    # negativa: e log com valor probatorio, nao sai junto por descuido.
+    if whiptail --title "NetFlow Cisco - Logs" --defaultno --yesno \
+"Apagar tambem o acervo de ${cisco_dir}?
+
+Isso destroi o NetFlow ja coletado desse equipamento e nao tem volta.
+Se houver oficio pendente sobre o periodo, responda NAO." 14 70; then
+        rm -rf "${cisco_dir:?}"
+        _hub_log WARN "netflow-cisco: acervo ${cisco_dir} apagado a pedido do operador"
+        whiptail --title "NetFlow Cisco" --msgbox "Equipamento e acervo removidos." 8 60
+    else
+        whiptail --title "NetFlow Cisco" --msgbox \
+"Equipamento removido.\n\nO acervo continua em ${cisco_dir}." 10 66
+    fi
+
+    return 0
+}
+
+fn_cisco_listar() {
+    _cisco_reg_init
+
+    local texto="" s estado tam arquivos antigo
+    local encontrados=0
+
+    for s in $(_cisco_reg_slugs); do
+        _cisco_reg_load "$s" || continue
+        encontrados=$(( encontrados + 1 ))
+
+        estado=$(systemctl is-active "nfcapd-${s}.service" 2>/dev/null)
+        tam=$(du -sh "$cisco_dir" 2>/dev/null | cut -f1)
+        arquivos=$(find "$cisco_dir" -type f -name 'nfcapd.*' 2>/dev/null | wc -l)
+        antigo=$(find "$cisco_dir" -type f -name 'nfcapd.*' -printf '%TY-%Tm-%Td\n' 2>/dev/null | sort | head -1)
+
+        texto+="${cisco_nome}  [${estado:-desconhecido}]\n"
+        texto+="  Porta:    ${cisco_porta}/udp\n"
+        texto+="  Pasta:    ${cisco_dir}\n"
+        texto+="  Step:     ${cisco_step}\n"
+        texto+="  Acervo:   ${arquivos} arquivo(s), ${tam:-0}\n"
+        texto+="  Mais ant: ${antigo:-sem arquivo}\n"
+        texto+="  Origens:  ${cisco_origens:-nenhuma}\n\n"
+    done
+
+    if (( encontrados == 0 )); then
+        whiptail --title "NetFlow Cisco" --msgbox "Nenhum equipamento cadastrado." 8 60
+        return 0
+    fi
+
+    texto+="Retencao: $(_cisco_kit_get RETENCAO 1830) dias\n"
+    texto+="Expiracao: $(systemctl is-active cgnat-cisco-expire.timer 2>/dev/null)\n"
+
+    whiptail --title "NetFlow Cisco - Equipamentos" --scrolltext --msgbox "$texto" 22 72
+    return 0
+}
+
 _dispatch() {
     local label="$1"; shift
     _hub_log INFO "menu: $label"
@@ -4369,11 +5679,12 @@ menu_dns() {
 menu_monitoramento() {
     while true; do
         choice=$(whiptail --title "Monitoramento / Logs" --cancel-button "Voltar" \
-            --menu "Selecione uma opcao:" 18 70 6 \
+            --menu "Selecione uma opcao:" 19 70 7 \
             "1" "Zabbix-Agent2 Padrao" \
             "2" "Zabbix-Agent2 com Monitoramento Unbound" \
             "3" "Configurar Usuario e Zabbix-Agent2 no PROXMOX" \
             "4" "Servidor Syslog CGNAT (coleta + consulta)" \
+            "5" "NetFlow CGNAT Cisco ASR (coleta + consulta)" \
             3>&1 1>&2 2>&3)
         [[ $? -ne 0 ]] && return 0
         case "$choice" in
@@ -4381,6 +5692,26 @@ menu_monitoramento() {
             2) _dispatch "Zabbix Agent2 + Unbound"      fn_zabbix_unbound ;;
             3) _dispatch "Zabbix Agent2 no Proxmox"     fn_proxmox_zabbix ;;
             4) _dispatch "Syslog CGNAT"                 fn_syslog_cgnat ;;
+            5) menu_netflow_cisco ;;
+        esac
+    done
+}
+
+menu_netflow_cisco() {
+    while true; do
+        choice=$(whiptail --title "NetFlow CGNAT Cisco (ASR)" --cancel-button "Voltar" \
+            --menu "Selecione uma opcao:" 18 70 6 \
+            "1" "Instalar kit (coleta + consulta)" \
+            "2" "Adicionar equipamento" \
+            "3" "Remover equipamento" \
+            "4" "Listar equipamentos e status" \
+            3>&1 1>&2 2>&3)
+        [[ $? -ne 0 ]] && return 0
+        case "$choice" in
+            1) _dispatch "NetFlow Cisco - instalar kit"      fn_cisco_netflow ;;
+            2) _dispatch "NetFlow Cisco - add equipamento"   fn_cisco_adicionar_equipamento ;;
+            3) _dispatch "NetFlow Cisco - rm equipamento"    fn_cisco_remover_equipamento ;;
+            4) _dispatch "NetFlow Cisco - listar"            fn_cisco_listar ;;
         esac
     done
 }
