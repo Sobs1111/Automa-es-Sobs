@@ -4400,6 +4400,9 @@ _cisco_reg_save() {
         printf 'NOME=%s\n'    "$cisco_nome"
         printf 'PORTA=%s\n'   "$cisco_porta"
         printf 'DIR=%s\n'     "$cisco_dir"
+        printf '# STEP e apenas o fallback do salto do bloco de portas.\n'
+        printf '# O hunter usa o pbstep que vem em cada flow; este valor so\n'
+        printf '# entra se o equipamento nao exportar o campo.\n'
         printf 'STEP=%s\n'    "$cisco_step"
         printf 'ORIGENS=%s\n' "$cisco_origens"
     } > "$file"
@@ -4552,20 +4555,10 @@ Se nao for um coletor deste kit, o servico novo vai falhar ao subir.
 Prosseguir mesmo assim?" 12 66 || return 1
     fi
 
-    # O hunter le o %pbstep de cada flow; este valor so entra quando o
-    # equipamento nao exporta o campo. Fixar 1 nesse caso esconde alocacao em
-    # caixa que aloca de N em N.
-    cisco_step=$(whiptail --title "NetFlow Cisco - Equipamento" \
-        --inputbox \
-"Salto (step) do bloco de portas de ${cisco_nome}:
-
-Usado apenas quando o equipamento nao exporta o campo pbstep.
-1 = bloco continuo." 14 66 "1" \
-        3>&1 1>&2 2>&3) || return 1
-    if ! [[ "$cisco_step" =~ ^[0-9]+$ ]] || (( cisco_step < 1 )); then
-        whiptail --title "Erro" --msgbox "Step invalido: $cisco_step" 8 60
-        return 1
-    fi
+    # O salto do bloco de portas nao e perguntado: o hunter le o %pbstep de cada
+    # flow. Este 1 e so o fallback para a caixa que nao exporta o campo, e nesse
+    # caso fica editavel a mao no registro do equipamento.
+    cisco_step="1"
 
     whiptail --title "NetFlow Cisco - Origens" --msgbox \
 "Informe os IPs ou blocos CIDR de ${cisco_nome} que exportam NetFlow.
@@ -5430,10 +5423,9 @@ _cisco_add_equipamento_flow() {
     resumo+="  Nome:     ${cisco_nome}\n"
     resumo+="  Porta:    ${cisco_porta}/udp\n"
     resumo+="  Pasta:    ${cisco_dir}\n"
-    resumo+="  Step:     ${cisco_step} (fallback)\n"
     resumo+="  Origens:  ${#cisco_equip_origens[@]}\n"
 
-    whiptail --title "NetFlow Cisco - Confirmacao" --yesno "$resumo" 16 66 || return 1
+    whiptail --title "NetFlow Cisco - Confirmacao" --yesno "$resumo" 15 66 || return 1
 
     _hub_log INFO "netflow-cisco: cadastrando ${cisco_nome} em ${cisco_porta}/udp"
 
@@ -5626,7 +5618,7 @@ fn_cisco_listar() {
         texto+="${cisco_nome}  [${estado:-desconhecido}]\n"
         texto+="  Porta:    ${cisco_porta}/udp\n"
         texto+="  Pasta:    ${cisco_dir}\n"
-        texto+="  Step:     ${cisco_step}\n"
+        texto+="  Step:     ${cisco_step} (so fallback; o flow manda o dele)\n"
         texto+="  Acervo:   ${arquivos} arquivo(s), ${tam:-0}\n"
         texto+="  Mais ant: ${antigo:-sem arquivo}\n"
         texto+="  Origens:  ${cisco_origens:-nenhuma}\n\n"
