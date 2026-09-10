@@ -4395,7 +4395,10 @@ _cisco_reg_load() {
 }
 
 _cisco_reg_save() {
-    local slug="$1" file="$CISCO_REG_DIR/$slug.conf"
+    # Duas declaracoes: o bash expande todos os argumentos do 'local' antes de
+    # executar qualquer atribuicao, entao $slug ainda estaria vazio aqui.
+    local slug="$1"
+    local file="$CISCO_REG_DIR/$slug.conf"
     {
         printf 'NOME=%s\n'    "$cisco_nome"
         printf 'PORTA=%s\n'   "$cisco_porta"
@@ -4643,7 +4646,11 @@ _cisco_criar_dirs() {
 }
 
 _cisco_criar_servico() {
-    local slug="$1" unit="/etc/systemd/system/nfcapd-${slug}.service" bin
+    # Duas declaracoes: o bash expande todos os argumentos do 'local' antes de
+    # executar qualquer atribuicao, entao $slug ainda estaria vazio aqui.
+    local slug="$1"
+    local unit="/etc/systemd/system/nfcapd-${slug}.service"
+    local bin
     bin=$(command -v nfcapd 2>/dev/null || printf '/usr/bin/nfcapd')
 
     cat > "$unit" <<EOF
