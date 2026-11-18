@@ -194,6 +194,205 @@ _unbound_restart() {
     systemctl restart unbound
 }
 
+_resolv_conf_nameservers() {
+    # Nameservers ativos do /etc/resolv.conf, um por linha. A leitura segue o
+    # symlink, entao vale tanto para arquivo normal quanto para o stub.
+    grep -E '^[[:space:]]*nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null \
+        | awk '{print $2}'
+}
+
+_resolv_conf_local() {
+    # Verdadeiro so quando TODO nameserver aponta para o loopback onde o
+    # Unbound escuta. O 127.0.0.53 do systemd-resolved tambem e loopback, mas
+    # nao e o Unbound: as consultas do proprio servidor sairiam pelo stub do
+    # resolved, sem passar pela base interna (local_zone.conf, zona reversa,
+    # blacklist, ACL) nem pelo cache que este servidor mantem.
+    local ns achou=0
+    while read -r ns; do
+        [[ -z "$ns" ]] && continue
+        achou=1
+        [[ "$ns" == "127.0.0.1" || "$ns" == "::1" ]] || return 1
+    done < <(_resolv_conf_nameservers)
+    (( achou == 1 ))
+}
+
+_resolv_conf_origem() {
+    # Quem pode reescrever o arquivo. Entra no relatorio porque define se a
+    # correcao precisa desarmar alguem para nao voltar atras no proximo boot
+    # ou no proximo renew de DHCP.
+    local origens=() destino
+    if [[ -L /etc/resolv.conf ]]; then
+        destino=$(readlink -f /etc/resolv.conf 2>/dev/null)
+        origens+=("symlink -> ${destino:-alvo inexistente}")
+    fi
+    systemctl is-enabled --quiet systemd-resolved 2>/dev/null \
+        && origens+=("systemd-resolved habilitado")
+    [[ -d /etc/resolvconf/resolv.conf.d ]] && origens+=("resolvconf instalado")
+    [[ -d /etc/NetworkManager/conf.d ]] && origens+=("NetworkManager instalado")
+    lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q i \
+        && origens+=("imutavel (chattr +i)")
+    if (( ${#origens[@]} == 0 )); then
+        echo "arquivo estatico"
+    else
+        printf '%s\n' "${origens[@]}"
+    fi
+}
+
+_resolv_conf_unbound_responde() {
+    # Guarda de seguranca: apontar o resolv.conf para 127.0.0.1 enquanto o
+    # Unbound nao responde deixa o servidor sem resolucao nenhuma - apt,
+    # chrony e zabbix param. Consulta localhost porque e respondido pela
+    # local-zone embutida, sem depender de recursao externa.
+    which dig &>/dev/null || return 0
+    local out
+    out=$(dig +short +time=2 +tries=1 @127.0.0.1 localhost A 2>/dev/null)
+    [[ -n "$out" ]]
+}
+
+_resolv_conf_forcar_local() {
+    # Fixa o resolv.conf em 127.0.0.1 e desarma os geradores que o
+    # sobrescreveriam. Reversivel: o backup fica em /etc/resolv.conf.hub.bak e
+    # o chattr -i libera o arquivo.
+    local acoes=()
+
+    if [[ -e /etc/resolv.conf || -L /etc/resolv.conf ]]; then
+        cp -L /etc/resolv.conf /etc/resolv.conf.hub.bak 2>/dev/null \
+            && acoes+=("backup em /etc/resolv.conf.hub.bak")
+    fi
+
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    if [[ -L /etc/resolv.conf ]]; then
+        rm -f /etc/resolv.conf
+        acoes+=("symlink removido")
+    fi
+
+    # O stub do resolved reescreve o arquivo a cada boot e nao tem funcao num
+    # servidor que ja roda recursivo proprio.
+    if systemctl is-enabled --quiet systemd-resolved 2>/dev/null \
+        || systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        systemctl disable --now systemd-resolved 2>/dev/null || true
+        acoes+=("systemd-resolved desabilitado")
+    fi
+
+    # resolvconf/openresolv regeram o arquivo a partir dos leases; o head e
+    # concatenado no topo de tudo que ele gerar.
+    if [[ -d /etc/resolvconf/resolv.conf.d ]]; then
+        printf 'nameserver 127.0.0.1\nnameserver ::1\n' \
+            > /etc/resolvconf/resolv.conf.d/head
+        acoes+=("resolvconf head fixado")
+    fi
+
+    # dhclient copia os nameservers do lease para o resolv.conf; zerar o
+    # make_resolv_conf mantem o DHCP cuidando de IP e rota, sem tocar em DNS.
+    if which dhclient &>/dev/null || [[ -d /etc/dhcp ]]; then
+        mkdir -p /etc/dhcp/dhclient-enter-hooks.d
+        cat > /etc/dhcp/dhclient-enter-hooks.d/hub-no-dns <<'EOF'
+# HUB-AUTOMACOES: este servidor resolve pelo Unbound local. Ignora os
+# nameservers oferecidos pelo DHCP para nao sobrescrever /etc/resolv.conf.
+make_resolv_conf() { :; }
+EOF
+        chmod 0755 /etc/dhcp/dhclient-enter-hooks.d/hub-no-dns
+        acoes+=("hook dhclient instalado")
+    fi
+
+    if [[ -d /etc/NetworkManager/conf.d ]]; then
+        cat > /etc/NetworkManager/conf.d/90-hub-dns.conf <<'EOF'
+# HUB-AUTOMACOES: o Unbound local e o resolver deste servidor.
+[main]
+dns=none
+systemd-resolved=false
+EOF
+        acoes+=("NetworkManager com dns=none")
+    fi
+
+    printf '%s\n' \
+        "# Gerado pelo HUB-AUTOMACOES: este servidor resolve pelo Unbound local." \
+        "nameserver 127.0.0.1" \
+        "nameserver ::1" \
+        "options timeout:1 attempts:2" \
+        > /etc/resolv.conf
+    chmod 0644 /etc/resolv.conf
+    chattr +i /etc/resolv.conf 2>/dev/null && acoes+=("arquivo marcado imutavel")
+
+    _hub_log INFO "resolv.conf forcado para 127.0.0.1 (${acoes[*]})"
+    printf '%s\n' "${acoes[@]}"
+}
+
+_unbound_checar_resolv_conf() {
+    # Checagem obrigatoria em recursivo e anycast: o resolv.conf do proprio
+    # servidor tem que apontar para 127.0.0.1. Com qualquer outro resolver ali
+    # as consultas originadas no servidor saem para fora em vez de passar pelo
+    # Unbound local.
+    local contexto="${1:-Unbound}"
+    local lista origem
+
+    lista=$(_resolv_conf_nameservers | paste -sd' ' -)
+    [[ -z "$lista" ]] && lista="(nenhum nameserver declarado)"
+    origem=$(_resolv_conf_origem | paste -sd', ' -)
+
+    if _resolv_conf_local; then
+        _hub_log INFO "resolv.conf ok em $contexto ($lista)"
+        whiptail --title "resolv.conf OK - $contexto" --msgbox \
+"/etc/resolv.conf aponta para o Unbound local.
+
+  nameserver(s) : $lista
+  origem        : $origem
+
+As consultas do proprio servidor passam pelo recursivo local." 14 68
+        return 0
+    fi
+
+    _hub_log WARN "resolv.conf fora do loopback em $contexto ($lista)"
+
+    local aviso=""
+    if ! _resolv_conf_unbound_responde; then
+        aviso="
+ATENCAO: o Unbound local nao respondeu em 127.0.0.1 agora. Corrigir
+antes de ele subir deixa o servidor sem resolucao nenhuma (apt,
+chrony, zabbix). Suba o Unbound primeiro.
+"
+    fi
+
+    whiptail --title "resolv.conf INCORRETO - $contexto" --yesno \
+"/etc/resolv.conf NAO aponta para o Unbound local:
+
+  nameserver(s) : $lista
+  origem        : $origem
+
+Com resolver externo aqui, toda consulta originada no servidor sai
+para fora em vez de consultar a base interna (local_zone, zona
+reversa, blacklist, ACL) e o cache local.
+$aviso
+Corrigir agora para 127.0.0.1? Sera feito backup em
+/etc/resolv.conf.hub.bak e os geradores que sobrescrevem o arquivo
+(systemd-resolved, resolvconf, dhclient, NetworkManager) serao
+desarmados." 24 70
+    [[ $? -ne 0 ]] && return 1
+
+    local acoes
+    acoes=$(_resolv_conf_forcar_local)
+
+    local depois verificacao
+    depois=$(_resolv_conf_nameservers | paste -sd' ' -)
+    if _resolv_conf_local; then
+        verificacao="OK - o servidor agora resolve pelo Unbound local."
+    else
+        verificacao="FALHOU - revise /etc/resolv.conf manualmente."
+    fi
+
+    whiptail --title "resolv.conf corrigido - $contexto" --msgbox \
+"nameserver(s) agora : $depois
+
+Alteracoes aplicadas:
+$acoes
+
+$verificacao
+
+Para reverter:
+  chattr -i /etc/resolv.conf
+  cp /etc/resolv.conf.hub.bak /etc/resolv.conf" 22 70
+}
+
 instalar_unbound_base() {
     apt install rsyslog ssh net-tools dnsutils unbound -y
 
@@ -550,6 +749,7 @@ fn_instalar_recursivo() {
     aplicar_sysctl
     fn_monitor_unbound_silencioso
     _unbound_restart
+    _unbound_checar_resolv_conf "Recursivo"
     whiptail --title "Concluido" --msgbox "Unbound recursivo instalado e configurado.\nServico de monitoramento instalado automaticamente." 10 60
     pos_dns
 }
@@ -2213,6 +2413,11 @@ EOF
 fn_teste_dns() {
     which dig &>/dev/null || apt-get install -y dnsutils
 
+    # Os testes abaixo consultam 127.0.0.1 explicitamente, entao passam mesmo
+    # com o resolv.conf apontando para fora - e e justamente essa divergencia
+    # que faz o resultado nao bater com o que a producao enxerga. Checa antes.
+    _unbound_checar_resolv_conf "Teste DNS"
+
     local dns_server_v4="127.0.0.1"
     local dns_server_v6="::1"
 
@@ -2861,6 +3066,7 @@ fn_anycast() {
     fn_configurar_irqbalance_anycast
     fn_configurar_chrony_anycast
     fn_configurar_logrotate_anycast
+    _unbound_checar_resolv_conf "Anycast"
 
     whiptail --title "DNS-RECURSIVO-ANYCAST" --yesno \
 "Deseja instalar e configurar o Zabbix-Agent2?" 8 55
